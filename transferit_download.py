@@ -418,8 +418,8 @@ def download_blob(url: str, size: int, chunk: int, jobs: int, kind: str) -> byte
     def one(se):
         a, b = se
         data = retry(lambda: fetch_range(url, a, b, kind))
-        if kind == "http" and len(data) != b - a + 1:
-            raise Retry(f"range {a}-{b}: got {len(data)} bytes")
+        if len(data) != b - a + 1:
+            raise Retry(f"range {a}-{b}: {len(data)} bytes back")
         return data
 
     if len(rs) == 1:
