@@ -475,6 +475,8 @@ def resolve_rel(n: dict, by_h: dict[str, dict]) -> str:
             parts.append(safe_name(parent["name"]))
         p = parent.get("p")
     parts.reverse()
+    if p:
+        raise RuntimeError(f"malformed transfer tree: missing parent {p!r}")
     return "/".join(parts)
 
 
@@ -498,6 +500,8 @@ def node_dirs(n: dict, by_h: dict[str, dict]) -> list[tuple[str, str]]:
             names.append(safe_name(parent.get("name") or ""))
             handles.append(p)
         p = parent.get("p")
+    if p:
+        raise RuntimeError(f"malformed transfer tree: missing parent {p!r}")
     return [("/".join(reversed(names[i:])), handle) for i, handle in enumerate(handles)]
 
 
@@ -667,8 +671,10 @@ def selfcheck() -> None:
             raise RequestException("down")
 
     real_session = session
+    real_backoff = _backoff
     try:
         globals()["session"] = lambda: Boom()
+        globals()["_backoff"] = lambda _i: None
         try:
             MegaAPI().call({"a": "xi", "xh": "a" * 12})
             raise AssertionError("api failure did not raise")
@@ -683,6 +689,7 @@ def selfcheck() -> None:
         assert calls[0] == 16, calls[0]
     finally:
         globals()["session"] = real_session
+        globals()["_backoff"] = real_backoff
     got = queue_run([1, 2, 3], lambda x: x * 10, jobs=2)
     assert got == [10, 20, 30]
     tok = create_password("EEDIThgnUbJZ", "testpass")
@@ -737,6 +744,13 @@ def selfcheck() -> None:
         raise AssertionError("cycle accepted by node_dirs")
     except RuntimeError:
         pass
+    dangling = {"r": {"h": "r", "p": "", "name": "root", "t": 1}, "f": {"h": "f", "p": "gone", "name": "x", "t": 0}}
+    for fn in (resolve_rel, node_dirs):
+        try:
+            fn(dangling["f"], dangling)
+            raise AssertionError(f"dangling parent accepted by {fn.__name__}")
+        except RuntimeError:
+            pass
     deep = {
         "r": {"h": "r", "p": "", "name": "root", "t": 1},
         "a": {"h": "a", "p": "r", "name": "a", "t": 1},

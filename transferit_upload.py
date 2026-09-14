@@ -534,9 +534,7 @@ def create_transfer(api: MegaAPI, name: str) -> tuple[str, str]:
         xh, h = res[1]
     else:
         raise RuntimeError(f"xn failed: {res}")
-    if not (isinstance(xh, str) and len(xh) == 12 and isinstance(h, str) and len(h) == 8):
-        raise RuntimeError(f"bad xn {res}")
-    return h, xh
+    return check_root_handle(h), check_transfer_id(xh)
 
 
 class ProgressBody:
@@ -665,7 +663,7 @@ def create_folder(api: MegaAPI, name: str, parent: str) -> str:
     nodes = res.get("f") if isinstance(res, dict) else None
     if not nodes:
         raise RuntimeError(f"xp folder failed: {res}")
-    return nodes[0]["h"]
+    return check_root_handle(nodes[0].get("h"))
 
 
 def skip_paths(state_path: Path) -> set[Path]:
@@ -768,14 +766,29 @@ XH_CHARS = set(string.ascii_letters + string.digits + "-_")
 HANDLE_CHARS = XH_CHARS
 
 
+def check_transfer_id(xh) -> str:
+    if not isinstance(xh, str) or len(xh) != 12 or not set(xh) <= XH_CHARS:
+        raise RuntimeError(f"bad transfer handle from the API: {xh!r}")
+    return xh
+
+
+def check_root_handle(h) -> str:
+    if not isinstance(h, str) or len(h) != 8 or not set(h) <= HANDLE_CHARS:
+        raise RuntimeError(f"bad root handle from the API: {h!r}")
+    return h
+
+
 def _check_handles(path: Path, where: str, xh, root_h, link) -> None:
     if xh:
         if not isinstance(xh, str) or len(xh) != 12 or not set(xh) <= XH_CHARS:
             raise ValueError(f"{path}: {where} transfer handle must be 12 base64url characters")
     if root_h and (not isinstance(root_h, str) or len(root_h) != 8 or not set(root_h) <= HANDLE_CHARS):
         raise ValueError(f"{path}: {where} root handle must be 8 base64url characters")
-    if link is not None and xh and link != f"https://transfer.it/t/{xh}":
-        raise ValueError(f"{path}: {where} link does not match its transfer handle")
+    if link is not None:
+        if not xh:
+            raise ValueError(f"{path}: {where} link without a transfer handle")
+        if link != f"https://transfer.it/t/{xh}":
+            raise ValueError(f"{path}: {where} link does not match its transfer handle")
 
 
 def _is_int(value) -> bool:
@@ -1181,12 +1194,14 @@ def selfcheck() -> None:
     # the API layer owns one retry budget: exhaustion is not retryable again by callers
     calls = [0]
     real_read = http_read
+    real_backoff = _backoff
     try:
         def always_down(*_a, **_kw):
             calls[0] += 1
             raise urllib.error.URLError("down")
 
         globals()["http_read"] = always_down
+        globals()["_backoff"] = lambda _i: None
         try:
             MegaAPI().req({"a": "u", "s": 1, "ssl": 1})
             raise AssertionError("api failure did not raise")
@@ -1201,6 +1216,7 @@ def selfcheck() -> None:
         assert calls[0] == 16, calls[0]
     finally:
         globals()["http_read"] = real_read
+        globals()["_backoff"] = real_backoff
 
     # completion handle: 36-char base64url body must not be mistaken for a raw handle
     def handle_of(body: bytes) -> str:
@@ -1262,6 +1278,8 @@ def selfcheck() -> None:
             {"mode": "tree", "xh": [1], "root_h": [2]},
             {"mode": "tree", "closed": True, "link": "https://transfer.it/t/" + "b" * 12, "xh": "a" * 12, "root_h": "c" * 8},
             {"mode": "tree", "closed": True, "link": "javascript:x", "xh": "x", "root_h": "y"},
+            {"mode": "tree", "closed": False, "link": "https://transfer.it/t/" + "a" * 12},
+            {"mode": "split", "jobs": {"a": {"link": "https://transfer.it/t/" + "a" * 12}}},
             {"mode": "tree", "xh": "short", "root_h": "b" * 8},
             {"mode": "tree", "xh": "a" * 12, "root_h": "tiny"},
             {"mode": "tree", "closed": True, "link": "https://transfer.it/t/" + "a" * 12, "xh": "a" * 12, "root_h": "b" * 4},
@@ -1307,6 +1325,19 @@ def selfcheck() -> None:
         assert load_state(tmp)["jobs"]["a"]["closed"] is True
     finally:
         shutil.rmtree(tmp.parent, ignore_errors=True)
+    try:
+        api = MegaAPI()
+        api.call = lambda payload, host=None: [0, ["\u00e9" * 12, "!" * 8]]
+        create_transfer(api, "bad")
+        raise AssertionError("malformed xn accepted")
+    except RuntimeError:
+        pass
+    try:
+        api.call = lambda payload, host=None: {"f": [{"h": "!"}]}
+        create_folder(api, "bad", "parent")
+        raise AssertionError("malformed folder handle accepted")
+    except RuntimeError:
+        pass
     print("selfcheck ok")
 
 
