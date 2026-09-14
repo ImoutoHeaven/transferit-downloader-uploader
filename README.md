@@ -1,111 +1,60 @@
 # transfer.it headless tools
 
-Two command line scripts and one optional native extension for moving files
-through [transfer.it](https://transfer.it) (MEGA) without a browser.
-
-| Path | Purpose |
-| --- | --- |
-| `transferit_upload.py` | Upload files and folders, produce transfer links |
-| `transferit_download.py` | Download one or more transfer links, plain or packed |
-| `megacrypt/` | Rust extension that encrypts uploads; wheels in `megacrypt/dist/` |
+Move files through [transfer.it](https://transfer.it) (MEGA) from a shell:
+`transferit_upload.py` uploads a folder and publishes links,
+`transferit_download.py` fetches links, and the Rust extension in `megacrypt/` encrypts
+uploads in native code.
 
 ## Requirements
 
-- Python 3.8 or newer; both scripts are exercised on 3.8, 3.9, 3.10, and 3.11.
-- `openssl` on `PATH` for the uploader (cipher fallback) and the downloader (decryption).
-- Uploader: `pip install tqdm`.
-- Downloader: `pip install curl_cffi`.
-- Uploader, optional and recommended: the `megacrypt` wheel, which moves encryption
-  into native code and releases the GIL.
+Python 3.8 or newer, and `openssl` on `PATH` for AES and MAC work.
 
-## Install
+```sh
+pip install tqdm        # uploader
+pip install curl_cffi   # downloader
+```
 
-Build the extension from source with a Rust toolchain and `maturin`:
+The optional `megacrypt` extension replaces the uploader's openssl subprocess with native
+code that releases the GIL, so `-j` threads encrypt in parallel. Build it with a Rust
+toolchain:
 
 ```sh
 pip install maturin
 cd megacrypt && python -m maturin build --release --out dist && pip install dist/*.whl
 ```
 
-`--out dist` names the output directory explicitly, because maturin otherwise writes to
-`target/wheels`. `megacrypt/dist/` holds build output and stays out of version control. The
-wheels use the stable ABI (abi3), so one wheel per platform serves every CPython from 3.8
-onward. Running the uploader without the extension works too: it falls back to the openssl
-pipeline.
+`--out dist` names the directory the install command reads; maturin writes to `target/wheels`
+by default. The wheels use the stable ABI (abi3), so one wheel per platform serves every
+CPython from 3.8 on. A Python-only install uses the openssl pipeline instead.
 
 ## Upload
 
 ```sh
-python transferit_upload.py -j 4 /data/2026-08                      # tree mode, one link
-python transferit_upload.py --mode split -j 4 /data/2026-08         # one link per folder
-python transferit_upload.py -v --state job.json /data/2026-08       # phase log + resume file
+python transferit_upload.py -j 4 /data/2026-08                    # one link for the folder
+python transferit_upload.py --mode split -j 4 /data/2026-08       # one link per folder
+python transferit_upload.py -v --state job.json /data/2026-08     # phase log and resume file
 ```
 
 | Flag | Default | Meaning |
 | --- | --- | --- |
-| `--mode tree` | yes | One link for the whole folder, relative paths preserved |
-| `--mode split` | | One link per folder containing direct files |
-| `-j, --jobs` | 4 | Total concurrent uploads, shared across folders |
+| `--mode` | `tree` | `tree`: one link, relative paths preserved. `split`: one link per folder holding direct files |
+| `-j, --jobs` | 4 | Concurrent uploads, shared across folders |
 | `--state` | `.transferit-upload.json` | Resume file, written atomically and kept out of the transfer |
-| `-v, --verbose` | | Timestamped phase log on stderr with a stall watchdog |
-| `--chunk-mib` | 8 | Streaming encrypt/read chunk per file |
+| `-v, --verbose` | | Timestamped phase log on stderr, with a stall watchdog |
+| `--chunk-mib` | 8 | Encrypt and read chunk per file; socket writes stay at 32 MiB |
 
-Tree mode takes exactly one path and prints one link. Split mode takes any number of
-paths, prints `folder: link` for each folder that published, then the bare links.
+Tree mode takes one path and prints one link. Split mode takes any number of paths and
+prints `folder: link` for each folder that published. A link appears once every file is
+registered and the transfer is closed.
 
-### Behaviour
+Files stream, so peak memory per in-flight file is bounded by a few chunks of `--chunk-mib`
+plus one 32 MiB write buffer, and socket inactivity is tolerated for `max(120, size / 256 KiB)`
+seconds.
 
-- A transfer link appears once every file and folder is in place. Registration of each
-  file (`xp`) precedes the close call (`xc`) that makes the link public.
-- Fail-closed. A tree upload stops when a file keeps failing, which leaves the transfer
-  unclosed and unpublished. A split upload skips only the failing folder's link and
-  publishes the folders that completed.
-- Folders holding direct files appear in the transfer.
-- Resume: state lives in the `--state` JSON (session, transfer handles, created folders,
-  per-file size/mtime/done, published link). Re-running the same command continues where
-  the previous run stopped; completed files are skipped.
-- Ctrl+C ends the process immediately. State is already on disk, so the next run resumes.
-- Progress shows a file-count bar from `tqdm`, replaced by the phase log under `-v`.
-- Streaming. Encryption and upload both work in chunks: peak memory tracks `--chunk-mib`
-  and the socket buffer. Per in-flight file, budget roughly three times the chunk for
-  encryption plus one 32 MiB write buffer.
-- Socket writes carry 32 MiB each, which roughly halves wall clock against 8 KiB writes.
-- `-j` bounds total concurrency: split mode divides it between folder workers and the
-  file workers inside each folder.
-- The per-request socket timeout is `max(120, size / 256KiB)` seconds, measured as
-  inactivity on the socket, so a large file gets a generous window while a silent peer
-  ends the attempt.
-- The state JSON is validated when loaded; a malformed or half-written record stops the
-  run with `error: ...` and a non-zero exit rather than being trusted.
-- Only folders holding direct files appear in the transfer; split mode targets those
-  folders, and tree mode creates the ancestor folders its relative paths need.
-
-### Traces
-
-`-v` prints one line per phase: API calls with latency, folder creation, upload URL
-acquisition, POST start and throughput, node registration, close, and the final link.
-A watchdog thread reports every in-flight file that has been idle for 25 seconds:
-
-```
-[20:04:34] verbose on; python=3.11.9 platform=win32
-[20:04:34] encoder=megacrypt .../site-packages/megacrypt/__init__.py
-[20:04:34] mode=tree root=/data/2026-08 files=2 (state=tr.json)
-[20:04:35] api up ok in 1.44s
-[20:04:36] api us ok in 1.41s
-[20:04:38] transfer created xh=TfwbNu4jFLSQ
-[20:04:39] folder sub created in 1.52s
-[20:04:39] queue: 2 file(s), 2 to upload, jobs=2
-[20:04:41] upload a.bin: got upload URL host=gfs440n010.userstorage.mega.co.nz in 1.59s
-[20:04:41] POST a.bin: sending 3145728 bytes to gfs440n010.userstorage.mega.co.nz (socket timeout 120s, encrypt chunk 8 MiB, socket write 32 MiB)
-[20:04:43] POST a.bin: done in 1.5s (1.98 MiB/s), response 36 bytes
-[20:04:44] upload a.bin: complete in 4.5s
-[20:04:44] <-- a.bin ok in 4.5s (state saved)
-[20:04:44] all files uploaded; closing transfer (xc)
-[20:04:45] link https://transfer.it/t/TfwbNu4jFLSQ
-```
-
-The first verbose line names the encoder, either `megacrypt` with its path or
-`openssl fallback`.
+Uploads fail closed: a file that keeps failing leaves the transfer unclosed and its link
+unpublished, while split mode still publishes the folders that completed. Re-running the
+same command resumes from the state file and skips completed files, and Ctrl+C ends the
+process immediately with that state already on disk.
 
 ## Download
 
@@ -119,81 +68,34 @@ python transferit_download.py --password "hunter2" https://transfer.it/t/XXXXXXX
 | Flag | Default | Meaning |
 | --- | --- | --- |
 | `-o, --out` | `downloads` | Output root; each link writes under `<out>/<link id>/` |
-| `-j, --jobs` | 4 | Total concurrent requests, shared across links, files and ranges |
-| `--chunk-size` | 1 MiB | Byte range size per range request |
-| `--zip` | | Packed download: the server zip when the transfer offers one, otherwise a local zip |
+| `-j, --jobs` | 4 | Concurrent requests, shared across links, files and ranges |
+| `--chunk-size` | 1 MiB | Bytes per range request |
+| `--zip` | | One archive per link: the server's zip when the transfer offers one, otherwise a local one |
+| `--password` | | Plaintext password for protected links |
 | `--no-verify` | | Skip the chunk MAC check on decrypted files |
-| `--password` | | Plaintext password for password-protected links |
-Relative paths inside a link are recreated on disk; the packed mode keeps the same
-structure inside the archive. Intermediate directories are created as needed. Every range
-response is required to carry exactly the requested length, and each decrypted file is
-checked against the chunk MAC in its file key (keys carrying per-chunk MACs from other
-clients are skipped). Payloads are written as they arrive: the downloader inspects neither
-the contents of archives nor encrypted files.
 
-Node names are reduced to a single safe path component, `.` and `..` members are dropped,
-and every write is verified to stay inside the destination directory. Two nodes that would
-land on the same path are refused rather than silently overwritten, as are ambiguous
-file/directory nests.
+Relative paths inside a link are recreated on disk, with intermediate directories created
+as needed. Every range response carries exactly the requested length, and each file is
+checked against the condensed chunk MAC in its file key. Keys in the per-chunk MAC form
+carry a different layout, so those files are written unverified; `--no-verify` does the same
+for every file.
 
-## Encoder
+Names are reduced to one safe path component, `.` and `..` members are dropped, and every
+write is verified to stay inside the destination. Two nodes that would land on the same
+path, or an ambiguous file/directory nest, stop the run before anything is overwritten.
 
-`transferit_upload.py` imports `megacrypt` and uses its `FileCipher` when the extension
-is installed; otherwise it runs the equivalent openssl pipeline in `EncStream`. Both
-implement the same wire format, and the test suite checks the two against each other
-byte for byte.
-
-`megacrypt` exposes:
-
-```python
-megacrypt.FileCipher(path, size, ul_key, chunk)   # .read(n) -> bytes, .filekey -> 8 words
-megacrypt.encrypt_bytes(data, ul_key, chunk)      # -> (bytes, [8 words])
-megacrypt.segment_ends(padded_len)                # MEGA chunk-MAC boundaries
-```
-
-Encryption runs inside `Python::allow_threads`, so `--jobs` threads encrypt in parallel.
-Measured on 8-core hosts, 128 MiB file, one run each:
-
-| Encoder | 1 file | 4 concurrent |
-| --- | --- | --- |
-| `megacrypt` (Windows) | 607 MiB/s | 0.30 s |
-| `megacrypt` (container, 4 CPUs) | 413 MiB/s | 0.64 s |
-| openssl pipeline (Windows) | 20 MiB/s | 7.96 s |
-| openssl pipeline (container, 4 CPUs) | 90 MiB/s | 11.15 s |
-
-## Wire format
-
-- Anonymous session: `up`, `us` on `g.api.mega.co.nz`; transfers created with `xn`,
-  files registered with `xp`, folders with `xp` (`t: 1`), close with `xc`, all on
-  `bt7.api.mega.co.nz`.
-- API calls are JSON arrays over `/cs?id=...&v=3&wcv=...&domain=transferit&sid=...`,
-  with `MEGA-Chrome-Antileak` set to the path and query. A `402` answer carries an
-  `X-Hashcash` challenge that the client solves and resends.
-- File key: 6 words. First 16 bytes are the AES-128 key, the last 8 bytes the nonce.
-- Content: AES-128-CTR with the counter starting at `nonce || 0^8`, 128-bit big-endian
-  increments, applied to the file padded to a 16-byte multiple.
-- Chunk MACs: segments ending at 128 KiB, 384 KiB, 768 KiB, 1280 KiB, 1920 KiB,
-  2688 KiB, 3584 KiB, and 4608 KiB, then at 1 MiB steps. Each segment is a fresh CBC
-  chain keyed by the file key with IV `nonce || nonce`, and its 16-byte result is folded
-  into a condensed state by XOR plus one AES block. The condensed state becomes words
-  2..7 of the file key.
-- Upload: `{"a": "u", "s": size, "ssl": 1}` returns a `userstorage` URL whose path takes
-  one POST carrying the whole encrypted file; the response body is a 36-character handle
-  used by `xp`.
-- Parallelism comes from multiple files in flight. One upload URL serves one whole-file
-  POST.
-- Attribute blocks (`a` on every node) are `MEGA` plus JSON, encrypted with AES-128-CBC
-  and a zero IV, keyed from the node key.
+Payloads are written as they arrive: archive and encrypted-file contents pass through
+untouched.
 
 ## Verification
 
 ```sh
-python transferit_upload.py --selfcheck       # cipher vectors, MAC boundaries, native vs openssl, state, interrupts
-python transferit_download.py --selfcheck     # decryption and MAC vectors, ranges, hostile names, queue
-cd megacrypt && cargo test --release          # cipher vectors, segment ramp, tail padding
+python transferit_upload.py --selfcheck     # cipher vectors, MAC boundaries, native vs openssl, retries, state
+python transferit_download.py --selfcheck   # decryption and MAC vectors, ranges, tree validation, hostile names
+cd megacrypt && cargo test --release        # cipher vectors, segment ramp, tail padding, key publication
 ```
 
-Linux builds, encoder equivalence, throughput, and a real upload/download round trip run
+Linux builds, encoder equivalence, throughput, and a real upload and download round trip run
 inside a container:
 
 ```sh
@@ -203,7 +105,5 @@ docker run --rm --cpus 4 \
   rust:1-slim-bookworm sh /verify.sh
 ```
 
-`dist/` is the wheel output directory the container writes into.
-
-The scripts exit non-zero on failure and print `error: ...` on stderr. Self-checks print
-`selfcheck ok`.
+Both self-checks run on CPython 3.8 and 3.11. Failures exit non-zero and print `error: ...`
+on stderr; self-checks print `selfcheck ok`.
