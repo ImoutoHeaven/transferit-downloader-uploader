@@ -485,6 +485,40 @@ def fold_key(name: str) -> str:
     return name.casefold() if os.name == "nt" else name
 
 
+def validate_tree(by_h: dict[str, dict]) -> str:
+    """Check the node graph is a single tree; return the transfer root handle.
+
+    Rejects a missing or duplicated root, parentless file nodes, dangling parents and
+    cycles, so every later walk can assume a well-formed graph.
+    """
+    roots = {h for h, n in by_h.items() if n.get("t") and not n.get("p")}
+    if len(roots) != 1:
+        raise RuntimeError(f"malformed transfer tree: {len(roots)} parentless folders")
+    root = roots.pop()
+    done: set[str] = set()
+
+    def under_root(handle: str, path: frozenset[str]) -> bool:
+        if handle == root:
+            return True
+        if handle in done:
+            return True
+        if handle in path:
+            raise RuntimeError("malformed transfer tree: parent cycle")
+        parent = by_h[handle].get("p")
+        if parent and parent not in by_h:
+            raise RuntimeError(f"malformed transfer tree: missing parent {parent!r}")
+        ok = bool(parent) and under_root(parent, path | {handle})
+        if ok:
+            done.add(handle)
+        return ok
+
+    for handle, node in by_h.items():
+        if handle != root and not under_root(handle, frozenset()):
+            name = node.get("name") or handle
+            raise RuntimeError(f"malformed transfer tree: {name!r} is not under the transfer root")
+    return root
+
+
 def require_parent(n: dict) -> str:
     """A file node always names the folder that holds it; only the transfer root is parentless."""
     p = n.get("p")
@@ -530,13 +564,13 @@ def load_nodes(
         name = decrypt_attr(n["a"], k).get("n") or n["h"]
         n = {**n, "k": k, "name": safe_name(name)}
         by_h[n["h"]] = n
+    validate_tree(by_h)
     files = []
     dirs: dict[str, set[str]] = {}
     for n in by_h.values():
         if n.get("t"):
             continue
         n["rel"] = resolve_rel(n, by_h)
-        require_parent(n)
         for path, handle in node_dirs(n, by_h):
             dirs.setdefault(fold_key(path), set()).add(handle)
         files.append(n)
@@ -773,6 +807,26 @@ def selfcheck() -> None:
             except RuntimeError:
                 pass
     assert require_parent({"p": "h"}) == "h"
+
+    good = {
+        "r": {"h": "r", "p": "", "name": "root", "t": 1},
+        "d": {"h": "d", "p": "r", "name": "dir", "t": 1},
+        "f": {"h": "f", "p": "d", "name": "x", "t": 0},
+        "g": {"h": "g", "p": "r", "name": "y", "t": 0},
+    }
+    assert validate_tree(good) == "r"
+    for broken, why in (
+        ({**good, "o": {"h": "o", "p": "", "name": "orphan", "t": 1}, "z": {"h": "z", "p": "o", "name": "z", "t": 0}}, "second parentless folder"),
+        ({**good, "o": {"h": "o", "p": "", "name": "orphan", "t": 0}}, "parentless file"),
+        ({**good, "z": {"h": "z", "p": "gone", "name": "z", "t": 0}}, "dangling parent"),
+        ({**good, "d": {"h": "d", "p": "e", "name": "dir", "t": 1}, "e": {"h": "e", "p": "d", "name": "loop", "t": 1}}, "cycle"),
+        ({"f": {"h": "f", "p": "r", "name": "x", "t": 0}, "r": {"h": "r", "p": "", "name": "root", "t": 1}, "o": {"h": "o", "p": "", "name": "o", "t": 1}}, "two roots"),
+    ):
+        try:
+            validate_tree(broken)
+            raise AssertionError(f"accepted a tree with {why}")
+        except RuntimeError:
+            pass
     deep = {
         "r": {"h": "r", "p": "", "name": "root", "t": 1},
         "a": {"h": "a", "p": "r", "name": "a", "t": 1},
