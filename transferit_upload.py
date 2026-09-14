@@ -13,6 +13,7 @@ import os
 import secrets
 import shutil
 import signal
+import string
 import struct
 import subprocess
 import sys
@@ -496,7 +497,7 @@ class MegaAPI:
             log(f"api {action} ok in {time.monotonic() - t0:.2f}s")
             clear_beat(f"api {action}")
             return data
-        raise last or RuntimeError("API retries exhausted")
+        raise RuntimeError(f"api {action} failed after 8 attempts: {last}")  # one owned retry budget
 
     def call(self, payload, host: str = G_API):
         res = self.req(payload, host)
@@ -763,6 +764,20 @@ class JobState:
             atomic_write(self.path, self.data)
 
 
+XH_CHARS = set(string.ascii_letters + string.digits + "-_")
+HANDLE_CHARS = XH_CHARS
+
+
+def _check_handles(path: Path, where: str, xh, root_h, link) -> None:
+    if xh:
+        if not isinstance(xh, str) or len(xh) != 12 or not set(xh) <= XH_CHARS:
+            raise ValueError(f"{path}: {where} transfer handle must be 12 base64url characters")
+    if root_h and (not isinstance(root_h, str) or len(root_h) != 8 or not set(root_h) <= HANDLE_CHARS):
+        raise ValueError(f"{path}: {where} root handle must be 8 base64url characters")
+    if link is not None and xh and link != f"https://transfer.it/t/{xh}":
+        raise ValueError(f"{path}: {where} link does not match its transfer handle")
+
+
 def _is_int(value) -> bool:
     return isinstance(value, int) and not isinstance(value, bool)
 
@@ -796,6 +811,7 @@ def load_state(path: Path) -> dict | None:
         raise ValueError(f"{path}: bad link")
     if data.get("closed") and not (data.get("link") and data.get("xh") and data.get("root_h")):
         raise ValueError(f"{path}: closed state needs a published link and a transfer handle")
+    _check_handles(path, "state", data.get("xh"), data.get("root_h"), data.get("link"))
     _check_files(path, data.get("files"))
     if data.get("jobs") is not None and not isinstance(data.get("jobs"), dict):
         raise ValueError(f"{path}: jobs must be an object")
@@ -816,11 +832,11 @@ def load_state(path: Path) -> dict | None:
                 raise ValueError(f"{path}: closed job for {key!r} needs a link and a transfer handle")
             if not job["link"].endswith(job["xh"]):
                 raise ValueError(f"{path}: job link for {key!r} does not match its transfer handle")
+        _check_handles(path, f"job {key!r}", job.get("xh"), job.get("root_h"), job.get("link"))
         _check_files(path, job.get("files"))
     if data.get("link") and data.get("xh") and not data["link"].endswith(data["xh"]):
         raise ValueError(f"{path}: link does not match the transfer handle")
     return data
-
 
 def bind_api(state: dict) -> MegaAPI:
     api = MegaAPI()
@@ -1162,6 +1178,30 @@ def selfcheck() -> None:
     assert not retryable(urllib.error.HTTPError("http://x", 404, "x", hdrs=None, fp=None))
     assert not retryable(KeyboardInterrupt())
 
+    # the API layer owns one retry budget: exhaustion is not retryable again by callers
+    calls = [0]
+    real_read = http_read
+    try:
+        def always_down(*_a, **_kw):
+            calls[0] += 1
+            raise urllib.error.URLError("down")
+
+        globals()["http_read"] = always_down
+        try:
+            MegaAPI().req({"a": "u", "s": 1, "ssl": 1})
+            raise AssertionError("api failure did not raise")
+        except RuntimeError as exc:
+            assert calls[0] == 8, calls[0]
+            assert not retryable(exc), exc
+        try:
+            retry(lambda: MegaAPI().req({"a": "u", "s": 1, "ssl": 1}), attempts=3, sleep=lambda _i: None)
+            raise AssertionError("outer retry swallowed the api failure")
+        except RuntimeError:
+            pass
+        assert calls[0] == 16, calls[0]
+    finally:
+        globals()["http_read"] = real_read
+
     # completion handle: 36-char base64url body must not be mistaken for a raw handle
     def handle_of(body: bytes) -> str:
         if len(body) == 36 and body.isascii() and all(c.isalnum() or c in "-_" for c in body.decode()):
@@ -1221,6 +1261,10 @@ def selfcheck() -> None:
             {"mode": "split", "jobs": {"a": {"closed": True, "link": "https://evil.example/", "xh": "x" * 12, "root_h": "y" * 8}}},
             {"mode": "tree", "xh": [1], "root_h": [2]},
             {"mode": "tree", "closed": True, "link": "https://transfer.it/t/" + "b" * 12, "xh": "a" * 12, "root_h": "c" * 8},
+            {"mode": "tree", "closed": True, "link": "javascript:x", "xh": "x", "root_h": "y"},
+            {"mode": "tree", "xh": "short", "root_h": "b" * 8},
+            {"mode": "tree", "xh": "a" * 12, "root_h": "tiny"},
+            {"mode": "tree", "closed": True, "link": "https://transfer.it/t/" + "a" * 12, "xh": "a" * 12, "root_h": "b" * 4},
         ):
             tmp.write_text(json.dumps(bad), encoding="utf-8")
             try:
@@ -1245,8 +1289,22 @@ def selfcheck() -> None:
             raise AssertionError("accepted a fractional mtime")
         except ValueError:
             pass
-        tmp.write_text(json.dumps({"mode": "split", "jobs": {"a": {"xh": "x", "root_h": "h"}}}), encoding="utf-8")
-        assert load_state(tmp)["jobs"]["a"]["root_h"] == "h"
+        tmp.write_text(json.dumps({"mode": "split", "jobs": {"a": {"xh": "x" * 12, "root_h": "h" * 8}}}), encoding="utf-8")
+        assert load_state(tmp)["jobs"]["a"]["root_h"] == "h" * 8
+        closed_job = {
+            "mode": "split",
+            "jobs": {
+                "a": {
+                    "xh": "c" * 12,
+                    "root_h": "d" * 8,
+                    "closed": True,
+                    "link": "https://transfer.it/t/" + "c" * 12,
+                    "files": {"f.txt": {"size": 2, "mtime": 1, "done": True}},
+                }
+            },
+        }
+        tmp.write_text(json.dumps(closed_job), encoding="utf-8")
+        assert load_state(tmp)["jobs"]["a"]["closed"] is True
     finally:
         shutil.rmtree(tmp.parent, ignore_errors=True)
     print("selfcheck ok")

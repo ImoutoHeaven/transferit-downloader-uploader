@@ -401,7 +401,7 @@ class MegaAPI:
             if isinstance(err, int) and err < 0:
                 raise RuntimeError(f"API error {err}")
             return data
-        raise last or RuntimeError("API retries exhausted")
+        raise RuntimeError(f"API request failed after 8 attempts: {last}")  # one owned retry budget
 
 
 def http_get(url: str, headers: dict | None = None, timeout: int = 120) -> bytes:
@@ -478,10 +478,15 @@ def resolve_rel(n: dict, by_h: dict[str, dict]) -> str:
     return "/".join(parts)
 
 
+def fold_key(name: str) -> str:
+    """Paths that collide on this platform share a key (Windows folds case)."""
+    return name.casefold() if os.name == "nt" else name
+
+
 def node_dirs(n: dict, by_h: dict[str, dict]) -> list[tuple[str, str]]:
     """(sanitized directory path, folder handle) for every ancestor of a file node."""
-    out: list[tuple[str, str]] = []
-    parts: list[str] = []
+    names: list[str] = []  # innermost first
+    handles: list[str] = []
     seen = {n.get("h")}
     p = n.get("p")
     while p and p in by_h:
@@ -489,11 +494,11 @@ def node_dirs(n: dict, by_h: dict[str, dict]) -> list[tuple[str, str]]:
             raise RuntimeError("malformed transfer tree: parent cycle")
         seen.add(p)
         parent = by_h[p]
-        if parent.get("p"):
-            parts.append(safe_name(parent.get("name") or ""))
-            out.append(("/".join(reversed(parts)), p))
+        if parent.get("p"):  # the transfer root itself contributes no path component
+            names.append(safe_name(parent.get("name") or ""))
+            handles.append(p)
         p = parent.get("p")
-    return out
+    return [("/".join(reversed(names[i:])), handle) for i, handle in enumerate(handles)]
 
 
 def load_nodes(
@@ -520,7 +525,7 @@ def load_nodes(
             continue
         n["rel"] = resolve_rel(n, by_h)
         for path, handle in node_dirs(n, by_h):
-            dirs.setdefault(path, set()).add(handle)
+            dirs.setdefault(fold_key(path), set()).add(handle)
         files.append(n)
     return info, files, dirs
 
@@ -546,11 +551,10 @@ def save(path: Path, data: bytes) -> None:
 
 def unique_rels(files: list[dict], dirs: dict[str, set[str]] | None = None) -> None:
     """Refuse transfers whose sanitized paths would collide or nest ambiguously."""
-    fold = (lambda s: s.casefold()) if os.name == "nt" else (lambda s: s)
     seen: dict[str, str] = {}
     for n in files:
         rel = safe_rel(n["rel"])
-        key = fold(rel)
+        key = fold_key(rel)
         if key in seen:
             raise RuntimeError(f"two nodes map to the same path: {seen[key]!r} and {n['rel']!r}")
         seen[key] = n["rel"]
@@ -560,12 +564,11 @@ def unique_rels(files: list[dict], dirs: dict[str, set[str]] | None = None) -> N
             prefix = "/".join(parts[:i])
             if prefix in seen:
                 raise RuntimeError(f"a file and a directory share the path {prefix!r}")
-    for path, handles in (dirs or {}).items():
-        key = fold(path)
+    for key, handles in (dirs or {}).items():
         if key in seen:
-            raise RuntimeError(f"a file and a directory share the path {path!r}")
+            raise RuntimeError(f"a file and a directory share the path {key!r}")
         if len(handles) > 1:
-            raise RuntimeError(f"two folders map to the same path {path!r}")
+            raise RuntimeError(f"two folders map to the same path {key!r}")
 
 
 def download_transfer(
@@ -654,6 +657,32 @@ def selfcheck() -> None:
         return "ok"
 
     assert retry(flaky) == "ok" and n[0] == 3
+
+    # the API layer owns one retry budget: exhaustion is not retryable again by callers
+    calls = [0]
+
+    class Boom:
+        def post(self, *_a, **_kw):
+            calls[0] += 1
+            raise RequestException("down")
+
+    real_session = session
+    try:
+        globals()["session"] = lambda: Boom()
+        try:
+            MegaAPI().call({"a": "xi", "xh": "a" * 12})
+            raise AssertionError("api failure did not raise")
+        except RuntimeError as exc:
+            assert calls[0] == 8, calls[0]
+            assert not retryable(exc), exc
+        try:
+            retry(lambda: MegaAPI().call({"a": "xi", "xh": "a" * 12}))
+            raise AssertionError("outer retry swallowed the api failure")
+        except RuntimeError:
+            pass
+        assert calls[0] == 16, calls[0]
+    finally:
+        globals()["session"] = real_session
     got = queue_run([1, 2, 3], lambda x: x * 10, jobs=2)
     assert got == [10, 20, 30]
     tok = create_password("EEDIThgnUbJZ", "testpass")
@@ -708,12 +737,27 @@ def selfcheck() -> None:
         raise AssertionError("cycle accepted by node_dirs")
     except RuntimeError:
         pass
-    chain = {
+    deep = {
         "r": {"h": "r", "p": "", "name": "root", "t": 1},
-        "d": {"h": "d", "p": "r", "name": "dir", "t": 1},
-        "f": {"h": "f", "p": "d", "name": "x", "t": 0},
+        "a": {"h": "a", "p": "r", "name": "a", "t": 1},
+        "b": {"h": "b", "p": "a", "name": "b", "t": 1},
+        "f": {"h": "f", "p": "b", "name": "file", "t": 0},
     }
-    assert node_dirs(chain["f"], chain) == [("dir", "d")]
+    assert node_dirs(deep["f"], deep) == [("a/b", "b"), ("a", "a")], node_dirs(deep["f"], deep)
+    assert resolve_rel(deep["f"], deep) == "a/b/file"
+    # sibling branches that share a subfolder name must stay distinct
+    unique_rels([{"rel": "A/X/f"}, {"rel": "B/X/g"}], {"A": {"hA"}, "A/X": {"hAX"}, "B": {"hB"}, "B/X": {"hBX"}})
+    for files_, dirs_ in (
+        ([{"rel": "ab/x/a"}], {"ab": {"h1"}, "ab/x": {"h2"}}),
+        ([{"rel": "ab/y/b"}], {"ab": {"h3"}, "ab/y": {"h4"}}),
+    ):
+        unique_rels(files_, dirs_)
+    for merged in ({"ab": {"h1", "h3"}}, {"ab": {"h1", "h3"}, "ab/x": {"h2"}}):
+        try:
+            unique_rels([{"rel": "ab/x/a"}], merged)
+            raise AssertionError(f"merged folders accepted: {merged}")
+        except RuntimeError:
+            pass
     try:
         parse_xh("\u00e9" * 12)
         raise AssertionError("non-ASCII transfer id accepted")

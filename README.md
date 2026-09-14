@@ -24,12 +24,14 @@ Build the extension from source with a Rust toolchain and `maturin`:
 
 ```sh
 pip install maturin
-cd megacrypt && python -m maturin build --release && pip install dist/*.whl
+cd megacrypt && python -m maturin build --release --out dist && pip install dist/*.whl
 ```
 
-`megacrypt/dist/` holds build output and stays out of version control. The wheels use the
-stable ABI (abi3), so one wheel per platform serves every CPython from 3.8 onward. Running
-the uploader without the extension works too: it falls back to the openssl pipeline.
+`--out dist` names the output directory explicitly, because maturin otherwise writes to
+`target/wheels`. `megacrypt/dist/` holds build output and stays out of version control. The
+wheels use the stable ABI (abi3), so one wheel per platform serves every CPython from 3.8
+onward. Running the uploader without the extension works too: it falls back to the openssl
+pipeline.
 
 ## Upload
 
