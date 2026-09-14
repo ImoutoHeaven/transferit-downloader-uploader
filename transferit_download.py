@@ -488,34 +488,29 @@ def fold_key(name: str) -> str:
 def validate_tree(by_h: dict[str, dict]) -> str:
     """Check the node graph is a single tree; return the transfer root handle.
 
-    Rejects a missing or duplicated root, parentless file nodes, dangling parents and
-    cycles, so every later walk can assume a well-formed graph.
+    Iterative, so deep trees are fine. Rejects a missing or duplicated root, parentless file
+    nodes, dangling parents and cycles, so every later walk can assume a well-formed graph.
     """
     roots = {h for h, n in by_h.items() if n.get("t") and not n.get("p")}
     if len(roots) != 1:
         raise RuntimeError(f"malformed transfer tree: {len(roots)} parentless folders")
     root = roots.pop()
-    done: set[str] = set()
-
-    def under_root(handle: str, path: frozenset[str]) -> bool:
-        if handle == root:
-            return True
-        if handle in done:
-            return True
-        if handle in path:
-            raise RuntimeError("malformed transfer tree: parent cycle")
-        parent = by_h[handle].get("p")
-        if parent and parent not in by_h:
-            raise RuntimeError(f"malformed transfer tree: missing parent {parent!r}")
-        ok = bool(parent) and under_root(parent, path | {handle})
-        if ok:
-            done.add(handle)
-        return ok
-
-    for handle, node in by_h.items():
-        if handle != root and not under_root(handle, frozenset()):
-            name = node.get("name") or handle
-            raise RuntimeError(f"malformed transfer tree: {name!r} is not under the transfer root")
+    done: set[str] = {root}
+    for handle in by_h:
+        chain: list[str] = []
+        cur = handle
+        while cur not in done:
+            if cur in chain:
+                raise RuntimeError("malformed transfer tree: parent cycle")
+            chain.append(cur)
+            parent = by_h[cur].get("p")
+            if not parent:
+                name = by_h[cur].get("name") or cur
+                raise RuntimeError(f"malformed transfer tree: {name!r} is not under the transfer root")
+            if parent not in by_h:
+                raise RuntimeError(f"malformed transfer tree: missing parent {parent!r}")
+            cur = parent
+        done.update(chain)
     return root
 
 
@@ -562,8 +557,10 @@ def load_nodes(
     for n in nodes:
         k = bytes_to_a32(b64u_decode(n["k"]))
         name = decrypt_attr(n["a"], k).get("n") or n["h"]
-        n = {**n, "k": k, "name": safe_name(name)}
-        by_h[n["h"]] = n
+        node = {**n, "k": k, "name": safe_name(name)}
+        if node["h"] in by_h:
+            raise RuntimeError(f"malformed transfer tree: repeated node handle {node['h']!r}")
+        by_h[node["h"]] = node
     validate_tree(by_h)
     files = []
     dirs: dict[str, set[str]] = {}
@@ -827,6 +824,34 @@ def selfcheck() -> None:
             raise AssertionError(f"accepted a tree with {why}")
         except RuntimeError:
             pass
+
+    # deep chains must validate without recursion, whichever order the API returns them in
+    depth = 1500
+    chain = {"r": {"h": "r", "p": "", "name": "root", "t": 1}}
+    for i in range(depth):
+        parent = "r" if i == 0 else f"d{i - 1}"
+        chain[f"d{i}"] = {"h": f"d{i}", "p": parent, "name": f"d{i}", "t": 1}
+    chain["file"] = {"h": "file", "p": f"d{depth - 1}", "name": "file", "t": 0}
+    assert validate_tree(dict(reversed(list(chain.items())))) == "r"
+
+    real_attr = decrypt_attr
+    try:
+        globals()["decrypt_attr"] = lambda at, _k: {"n": at}
+        api = MegaAPI()
+        api.call = lambda payload, extra=None: {
+            "f": [
+                {"h": "r", "p": "", "t": 1, "k": "AA", "a": "root"},
+                {"h": "dup", "p": "r", "t": 0, "k": "AA", "a": "first"},
+                {"h": "dup", "p": "r", "t": 0, "k": "AA", "a": "second"},
+            ]
+        }
+        try:
+            load_nodes(api, "a" * 12)
+            raise AssertionError("repeated node handle accepted")
+        except RuntimeError:
+            pass
+    finally:
+        globals()["decrypt_attr"] = real_attr
     deep = {
         "r": {"h": "r", "p": "", "name": "root", "t": 1},
         "a": {"h": "a", "p": "r", "name": "a", "t": 1},
