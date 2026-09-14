@@ -221,12 +221,18 @@ def parse_xh(s: str) -> str:
     return s
 
 
+WIN_RESERVED = {"CON", "PRN", "AUX", "NUL"} | {f"COM{i}" for i in range(1, 10)} | {f"LPT{i}" for i in range(1, 10)}
+
+
 def safe_name(name: str) -> str:
-    """One path component, never a traversal token."""
+    """One path component that cannot escape a directory on either platform."""
     name = name.replace("\\", "/").split("/")[-1].replace("\x00", "").strip()
-    name = "".join(c for c in name if c.isprintable() and c not in '<>:"|?*')
+    # ':' would introduce a Windows drive or stream path when joined onto a directory
+    name = "".join(c for c in name if c.isprintable() and c != ":")
     if set(name) <= {"."}:
         name = "_" * len(name)
+    if name.split(".")[0].upper() in WIN_RESERVED:
+        name = "_" + name
     return name or "file"
 
 
@@ -562,6 +568,8 @@ def selfcheck() -> None:
     # hostile node names must stay inside the output directory
     assert safe_name("..") == "__" and safe_name(".") == "_" and safe_name("a/b") == "b"
     assert safe_name("nul\x00l") == "null" and safe_name("   ") == "file"
+    assert safe_name("C:evil") == "Cevil" and safe_name("nul") == "_nul" and safe_name("COM1.txt") == "_COM1.txt"
+    assert safe_name("12:30 mix.mp3") == "1230 mix.mp3" and safe_name("plain name.mp4") == "plain name.mp4"
     assert safe_rel("../../etc/passwd") == "etc/passwd"
     assert safe_rel("a/../b") == "a/b"
     hostile = {
