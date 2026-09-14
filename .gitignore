@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+*.pyo
+megacrypt/target/
+megacrypt/Cargo.lock.orig
+.transferit-upload.json
+downloads/
+downloads-*/
+maxbody/
+maxbody.log
+e2e_*/
+bench*.bin
+*.log
