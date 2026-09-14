@@ -11,3 +11,4 @@ maxbody.log
 e2e_*/
 bench*.bin
 *.log
+megacrypt/dist/
