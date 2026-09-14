@@ -488,20 +488,28 @@ def fold_key(name: str) -> str:
 def validate_tree(by_h: dict[str, dict]) -> str:
     """Check the node graph is a single tree; return the transfer root handle.
 
-    Iterative, so deep trees are fine. Rejects a missing or duplicated root, parentless file
-    nodes, dangling parents and cycles, so every later walk can assume a well-formed graph.
+    Node kinds must be the integers 0 (file) and 1 (folder); every parent must be a folder.
+    Iterative, so deep trees validate in linear time and in any API order. Rejects a missing
+    or duplicated root, parentless file nodes, dangling parents, non-folder parents and
+    cycles, so every later walk can assume a well-formed graph.
     """
-    roots = {h for h, n in by_h.items() if n.get("t") and not n.get("p")}
+    for handle, node in by_h.items():
+        kind = node.get("t")
+        if isinstance(kind, bool) or kind not in (0, 1):
+            raise RuntimeError(f"malformed transfer tree: node {handle!r} has type {kind!r}")
+    roots = {h for h, n in by_h.items() if n["t"] == 1 and not n.get("p")}
     if len(roots) != 1:
         raise RuntimeError(f"malformed transfer tree: {len(roots)} parentless folders")
     root = roots.pop()
     done: set[str] = {root}
     for handle in by_h:
         chain: list[str] = []
+        seen: set[str] = set()
         cur = handle
         while cur not in done:
-            if cur in chain:
+            if cur in seen:
                 raise RuntimeError("malformed transfer tree: parent cycle")
+            seen.add(cur)
             chain.append(cur)
             parent = by_h[cur].get("p")
             if not parent:
@@ -509,6 +517,8 @@ def validate_tree(by_h: dict[str, dict]) -> str:
                 raise RuntimeError(f"malformed transfer tree: {name!r} is not under the transfer root")
             if parent not in by_h:
                 raise RuntimeError(f"malformed transfer tree: missing parent {parent!r}")
+            if by_h[parent]["t"] != 1:
+                raise RuntimeError(f"malformed transfer tree: parent {parent!r} is not a folder")
             cur = parent
         done.update(chain)
     return root
@@ -818,6 +828,10 @@ def selfcheck() -> None:
         ({**good, "z": {"h": "z", "p": "gone", "name": "z", "t": 0}}, "dangling parent"),
         ({**good, "d": {"h": "d", "p": "e", "name": "dir", "t": 1}, "e": {"h": "e", "p": "d", "name": "loop", "t": 1}}, "cycle"),
         ({"f": {"h": "f", "p": "r", "name": "x", "t": 0}, "r": {"h": "r", "p": "", "name": "root", "t": 1}, "o": {"h": "o", "p": "", "name": "o", "t": 1}}, "two roots"),
+        ({**good, "z": {"h": "z", "p": "r", "name": "z", "t": "0"}}, "a string node type"),
+        ({**good, "z": {"h": "z", "p": "r", "name": "z", "t": True}}, "a boolean node type"),
+        ({**good, "z": {"h": "z", "p": "r", "name": "z", "t": 2}}, "an unknown node type"),
+        ({**good, "z": {"h": "z", "p": "f", "name": "z", "t": 0}}, "a file as parent"),
     ):
         try:
             validate_tree(broken)
