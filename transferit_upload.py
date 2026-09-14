@@ -797,16 +797,28 @@ def load_state(path: Path) -> dict | None:
     if data.get("closed") and not (data.get("link") and data.get("xh") and data.get("root_h")):
         raise ValueError(f"{path}: closed state needs a published link and a transfer handle")
     _check_files(path, data.get("files"))
+    if data.get("jobs") is not None and not isinstance(data.get("jobs"), dict):
+        raise ValueError(f"{path}: jobs must be an object")
     for key, job in (data.get("jobs") or {}).items():
         if not isinstance(job, dict) or ("path" in job and not isinstance(job["path"], str)):
             raise ValueError(f"{path}: bad job record for {key!r}")
+        for field in ("xh", "root_h"):
+            if field in job and job[field] is not None and not isinstance(job[field], str):
+                raise ValueError(f"{path}: bad {field} for job {key!r}")
         if bool(job.get("xh")) != bool(job.get("root_h")):
             raise ValueError(f"{path}: job record for {key!r} is incomplete")
+        if "closed" in job and not isinstance(job["closed"], bool):
+            raise ValueError(f"{path}: bad closed flag for job {key!r}")
         if job.get("link") is not None and not isinstance(job["link"], str):
             raise ValueError(f"{path}: bad job link for {key!r}")
-        if job.get("closed") and not (job.get("link") and job.get("xh")):
-            raise ValueError(f"{path}: closed job for {key!r} needs a link and a transfer handle")
+        if job.get("closed"):
+            if not (job.get("link") and job.get("xh")):
+                raise ValueError(f"{path}: closed job for {key!r} needs a link and a transfer handle")
+            if not job["link"].endswith(job["xh"]):
+                raise ValueError(f"{path}: job link for {key!r} does not match its transfer handle")
         _check_files(path, job.get("files"))
+    if data.get("link") and data.get("xh") and not data["link"].endswith(data["xh"]):
+        raise ValueError(f"{path}: link does not match the transfer handle")
     return data
 
 
@@ -1204,6 +1216,11 @@ def selfcheck() -> None:
             {"mode": "tree", "files": {"a.txt": {"size": 1, "mtime": 0, "done": "false"}}},
             {"mode": "tree", "xh": "a" * 12},
             {"mode": "split", "jobs": {"a": {"closed": True, "link": "l"}}},
+            {"mode": "split", "jobs": []},
+            {"mode": "split", "jobs": {"a": {"closed": "yes", "link": "l", "xh": "x" * 12, "root_h": "y" * 8}}},
+            {"mode": "split", "jobs": {"a": {"closed": True, "link": "https://evil.example/", "xh": "x" * 12, "root_h": "y" * 8}}},
+            {"mode": "tree", "xh": [1], "root_h": [2]},
+            {"mode": "tree", "closed": True, "link": "https://transfer.it/t/" + "b" * 12, "xh": "a" * 12, "root_h": "c" * 8},
         ):
             tmp.write_text(json.dumps(bad), encoding="utf-8")
             try:
@@ -1235,7 +1252,17 @@ def selfcheck() -> None:
     print("selfcheck ok")
 
 
+def relax_stream_errors() -> None:
+    """Non-ASCII names must not crash printing on a narrow console encoding."""
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(errors="replace")
+        except (AttributeError, ValueError):
+            pass
+
+
 def main(argv: list[str] | None = None) -> int:
+    relax_stream_errors()
     ap = argparse.ArgumentParser(description="Upload files/folders to transfer.it.")
     ap.add_argument("paths", nargs="*", type=Path)
     ap.add_argument("--selfcheck", action="store_true")

@@ -205,6 +205,9 @@ impl Core {
                 let take = std::cmp::min(n - out.len(), self.pending.len() - self.pending_pos);
                 out.extend_from_slice(&self.pending[self.pending_pos..self.pending_pos + take]);
                 self.pending_pos += take;
+                if self.pending_pos == self.pending.len() && self.off >= self.padded {
+                    self.finish(); // the file key is ready as soon as the last byte is delivered
+                }
                 continue;
             }
             if self.off >= self.padded {
@@ -409,6 +412,24 @@ mod tests {
         let (want, want_key) = encrypt_bytes_inner(&data, &UL_KEY, 4096).unwrap();
         assert_eq!(rest.len(), want.len() - 208);
         assert_eq!(core.filekey.unwrap(), want_key);
+    }
+
+    #[test]
+    fn filekey_arrives_with_the_last_byte() {
+        for size in [16usize, 100, 4096, 4097, 9000] {
+            let data: Vec<u8> = (0..size).map(|i| (i % 251) as u8).collect();
+            let mut core = Core::new(Box::new(Cursor::new(data.clone())), size as u64, &UL_KEY, 4096).unwrap();
+            let mut got = Vec::new();
+            while got.len() < size {
+                let piece = core.pull(size - got.len()).unwrap();
+                assert!(!piece.is_empty(), "size {size}");
+                got.extend_from_slice(&piece);
+            }
+            assert_eq!(got.len(), size);
+            assert!(core.filekey.is_some(), "size {size}: key not published with the last byte");
+            let (_, want_key) = encrypt_bytes_inner(&data, &UL_KEY, 4096).unwrap();
+            assert_eq!(core.filekey.unwrap(), want_key, "size {size}");
+        }
     }
 
     #[test]

@@ -20,18 +20,16 @@ through [transfer.it](https://transfer.it) (MEGA) without a browser.
 
 ## Install
 
-```sh
-pip install "megacrypt/dist/megacrypt-0.1.0-cp38-abi3-manylinux_2_34_x86_64.whl"   # Linux, glibc >= 2.34
-pip install "megacrypt/dist/megacrypt-0.1.0-cp38-abi3-win_amd64.whl"               # Windows
-```
-
-The wheels use the stable ABI (abi3), so one wheel per platform serves every CPython
-from 3.8 onward. Build your own with a Rust toolchain and `maturin`:
+Build the extension from source with a Rust toolchain and `maturin`:
 
 ```sh
 pip install maturin
 cd megacrypt && python -m maturin build --release && pip install dist/*.whl
 ```
+
+`megacrypt/dist/` holds build output and stays out of version control. The wheels use the
+stable ABI (abi3), so one wheel per platform serves every CPython from 3.8 onward. Running
+the uploader without the extension works too: it falls back to the openssl pipeline.
 
 ## Upload
 
@@ -128,12 +126,13 @@ Relative paths inside a link are recreated on disk; the packed mode keeps the sa
 structure inside the archive. Intermediate directories are created as needed. Every range
 response is required to carry exactly the requested length, and each decrypted file is
 checked against the chunk MAC in its file key (keys carrying per-chunk MACs from other
-clients are skipped).
+clients are skipped). Payloads are written as they arrive: the downloader inspects neither
+the contents of archives nor encrypted files.
 
 Node names are reduced to a single safe path component, `.` and `..` members are dropped,
 and every write is verified to stay inside the destination directory. Two nodes that would
-land on the same path are refused, as is a server archive whose members would escape on
-extraction; members of the archive this tool builds are sanitized the same way.
+land on the same path are refused rather than silently overwritten, as are ambiguous
+file/directory nests.
 
 ## Encoder
 
@@ -196,10 +195,13 @@ Linux builds, encoder equivalence, throughput, and a real upload/download round 
 inside a container:
 
 ```sh
+mkdir -p megacrypt/dist
 docker run --rm --cpus 4 \
   -v "$PWD:/w:ro" -v "$PWD/megacrypt/dist:/out" -v "$PWD/megacrypt/verify-linux.sh:/verify.sh:ro" \
   rust:1-slim-bookworm sh /verify.sh
 ```
+
+`dist/` is the wheel output directory the container writes into.
 
 The scripts exit non-zero on failure and print `error: ...` on stderr. Self-checks print
 `selfcheck ok`.

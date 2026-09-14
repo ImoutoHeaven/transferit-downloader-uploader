@@ -10,6 +10,7 @@ import os
 import secrets
 import shutil
 import signal
+import string
 import struct
 import subprocess
 import sys
@@ -226,12 +227,15 @@ def create_password(xh: str, password: str) -> str:
     return b64u_encode(dk)
 
 
+XH_ALPHABET = set(string.ascii_letters + string.digits + "-_")
+
+
 def parse_xh(s: str) -> str:
     s = s.strip()
     if "/t/" in s:
         s = s.rsplit("/t/", 1)[-1]
     s = s.split("?", 1)[0].strip("/")
-    if len(s) != 12 or not all(c.isalnum() or c in "-_" for c in s):
+    if len(s) != 12 or not set(s) <= XH_ALPHABET:
         raise ValueError(f"bad transfer.it link: {s}")
     return s
 
@@ -436,7 +440,7 @@ def download_blob(url: str, size: int, chunk: int, jobs: int, kind: str) -> byte
 
     def one(se):
         a, b = se
-        data = retry(lambda: fetch_range(url, a, b, kind))
+        data = fetch_range(url, a, b, kind)  # retries belong to the queue, not to each range
         if len(data) != b - a + 1:
             raise Retry(f"range {a}-{b}: {len(data)} bytes back")
         return data
@@ -474,7 +478,28 @@ def resolve_rel(n: dict, by_h: dict[str, dict]) -> str:
     return "/".join(parts)
 
 
-def load_nodes(api: MegaAPI, xh: str, password: str | None = None) -> tuple[dict, list[dict]]:
+def node_dirs(n: dict, by_h: dict[str, dict]) -> list[tuple[str, str]]:
+    """(sanitized directory path, folder handle) for every ancestor of a file node."""
+    out: list[tuple[str, str]] = []
+    parts: list[str] = []
+    seen = {n.get("h")}
+    p = n.get("p")
+    while p and p in by_h:
+        if p in seen:
+            raise RuntimeError("malformed transfer tree: parent cycle")
+        seen.add(p)
+        parent = by_h[p]
+        if parent.get("p"):
+            parts.append(safe_name(parent.get("name") or ""))
+            out.append(("/".join(reversed(parts)), p))
+        p = parent.get("p")
+    return out
+
+
+def load_nodes(
+    api: MegaAPI, xh: str, password: str | None = None
+) -> tuple[dict, list[dict], dict[str, set[str]]]:
+    """Return (transfer info, file nodes carrying `rel`, sanitized dir path -> folder handles)."""
     info = api.call({"a": "xi", "xh": xh})
     if isinstance(info, dict) and info.get("pw"):
         if not password:
@@ -489,39 +514,58 @@ def load_nodes(api: MegaAPI, xh: str, password: str | None = None) -> tuple[dict
         n = {**n, "k": k, "name": safe_name(name)}
         by_h[n["h"]] = n
     files = []
+    dirs: dict[str, set[str]] = {}
     for n in by_h.values():
         if n.get("t"):
             continue
         n["rel"] = resolve_rel(n, by_h)
+        for path, handle in node_dirs(n, by_h):
+            dirs.setdefault(path, set()).add(handle)
         files.append(n)
-    return info, files
+    return info, files, dirs
+
+
+def temp_path(directory: Path, suffix: str) -> Path:
+    """Unique staging name: collisions with real members are impossible, the fd is closed."""
+    directory.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=directory, prefix=".dl-", suffix=suffix)
+    os.close(fd)
+    return Path(tmp)
 
 
 def save(path: Path, data: bytes) -> None:
-    """Write through a temporary name so a failed write leaves no partial final file."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(path.name + ".part")
-    tmp.write_bytes(data)
-    os.replace(tmp, path)
+    """Write through a unique temporary name so a failed write leaves no partial final file."""
+    tmp = temp_path(path.parent, ".part")
+    try:
+        tmp.write_bytes(data)
+        os.replace(tmp, path)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
 
 
-def unique_rels(files: list[dict]) -> None:
-    """Refuse transfers where two nodes would land on the same path after sanitizing."""
+def unique_rels(files: list[dict], dirs: dict[str, set[str]] | None = None) -> None:
+    """Refuse transfers whose sanitized paths would collide or nest ambiguously."""
     fold = (lambda s: s.casefold()) if os.name == "nt" else (lambda s: s)
     seen: dict[str, str] = {}
     for n in files:
-        key = fold(safe_rel(n["rel"]))
+        rel = safe_rel(n["rel"])
+        key = fold(rel)
         if key in seen:
             raise RuntimeError(f"two nodes map to the same path: {seen[key]!r} and {n['rel']!r}")
         seen[key] = n["rel"]
-
-
-def zip_members_safe(path: Path) -> None:
-    """Reject a server-packed archive whose members would escape on extraction."""
-    with zipfile.ZipFile(path) as zf:
-        for name in zf.namelist():
-            if not name.endswith("/") and safe_rel(name) != name.replace("\\", "/"):
-                raise RuntimeError(f"unsafe archive member in server zip: {name!r}")
+    for key in seen:
+        parts = key.split("/")
+        for i in range(1, len(parts)):
+            prefix = "/".join(parts[:i])
+            if prefix in seen:
+                raise RuntimeError(f"a file and a directory share the path {prefix!r}")
+    for path, handles in (dirs or {}).items():
+        key = fold(path)
+        if key in seen:
+            raise RuntimeError(f"a file and a directory share the path {path!r}")
+        if len(handles) > 1:
+            raise RuntimeError(f"two folders map to the same path {path!r}")
 
 
 def download_transfer(
@@ -534,7 +578,7 @@ def download_transfer(
     password: str | None = None,
     verify: bool = True,
 ) -> list[Path]:
-    info, files = load_nodes(api, xh, password)
+    info, files, dirs = load_nodes(api, xh, password)
     dest.mkdir(parents=True, exist_ok=True)
     z = info.get("z") if isinstance(info, dict) else None
     written: list[Path] = []
@@ -549,22 +593,25 @@ def download_transfer(
             url, size = g_url(api, xh, z, plain=True)
             data = download_blob(url, size, chunk, jobs, kind="http")
             save(path, data)
-            zip_members_safe(path)
             return [path]
-        unique_rels(files)
+        unique_rels(files, dirs)
         buf = dest / f"{xh}.zip"
-        tmp = buf.with_name(buf.name + ".part")
-        with zipfile.ZipFile(tmp, "w", compression=zipfile.ZIP_STORED) as zf:
-            def one(n):
-                url, size = g_url(api, xh, n["h"], plain=False)
-                enc = download_blob(url, size or n.get("s") or 0, chunk, per_file, kind="mega")
-                return n["rel"], decrypt_verified(enc, n["k"], verify)
-            for rel, data in queue_run(files, one, workers):
-                zf.writestr(safe_rel(rel), data)
-        os.replace(tmp, buf)
+        staged = temp_path(dest, ".zip")
+        try:
+            with zipfile.ZipFile(staged, "w", compression=zipfile.ZIP_STORED) as zf:
+                def one(n):
+                    url, size = g_url(api, xh, n["h"], plain=False)
+                    enc = download_blob(url, size or n.get("s") or 0, chunk, per_file, kind="mega")
+                    return n["rel"], decrypt_verified(enc, n["k"], verify)
+                for rel, data in queue_run(files, one, workers):
+                    zf.writestr(safe_rel(rel), data)
+            os.replace(staged, buf)
+        except BaseException:
+            staged.unlink(missing_ok=True)
+            raise
         return [buf]
 
-    unique_rels(files)
+    unique_rels(files, dirs)
 
     def one(n):
         url, size = g_url(api, xh, n["h"], plain=False)
@@ -643,34 +690,44 @@ def selfcheck() -> None:
     except RuntimeError:
         pass
     unique_rels([{"rel": "a.txt"}, {"rel": "b.txt"}, {"rel": "dir/c.txt"}])
+    for bad_files, bad_dirs in (
+        ([{"rel": "ab"}, {"rel": "a:b"}], None),
+        ([{"rel": "dup.txt"}, {"rel": "dup.txt"}], None),
+        ([{"rel": "a"}, {"rel": "a/b"}], None),
+        ([{"rel": "ab/x"}], {"ab": {"h1", "h2"}}),
+        ([{"rel": "ab"}], {"ab": {"h1"}}),
+    ):
+        try:
+            unique_rels(bad_files, bad_dirs)
+            raise AssertionError(f"accepted collision {bad_files} {bad_dirs}")
+        except RuntimeError:
+            pass
+    unique_rels([{"rel": "a/b.txt"}, {"rel": "a/c.txt"}], {"a": {"h1"}})
     try:
-        unique_rels([{"rel": "ab"}, {"rel": "a:b"}])
-        raise AssertionError("collision not reported")
+        node_dirs(cycle["f"], cycle)
+        raise AssertionError("cycle accepted by node_dirs")
     except RuntimeError:
         pass
+    chain = {
+        "r": {"h": "r", "p": "", "name": "root", "t": 1},
+        "d": {"h": "d", "p": "r", "name": "dir", "t": 1},
+        "f": {"h": "f", "p": "d", "name": "x", "t": 0},
+    }
+    assert node_dirs(chain["f"], chain) == [("dir", "d")]
     try:
-        unique_rels([{"rel": "dup.txt"}, {"rel": "dup.txt"}])
-        raise AssertionError("duplicate node not reported")
-    except RuntimeError:
+        parse_xh("\u00e9" * 12)
+        raise AssertionError("non-ASCII transfer id accepted")
+    except ValueError:
         pass
     tmp = Path(tempfile.mkdtemp())
     try:
         payload = b"payload"
-        bad_zip = tmp / "bad.zip"
-        with zipfile.ZipFile(bad_zip, "w") as zf:
-            zf.writestr("../payload", payload)
-        try:
-            zip_members_safe(bad_zip)
-            raise AssertionError("traversal member accepted")
-        except RuntimeError:
-            pass
-        good_zip = tmp / "good.zip"
-        with zipfile.ZipFile(good_zip, "w") as zf:
-            zf.writestr("dir/payload", payload)
-        zip_members_safe(good_zip)
         target = tmp / "sub" / "file.bin"
         save(target, payload)
-        assert target.read_bytes() == payload and not list(tmp.rglob("*.part"))
+        assert target.read_bytes() == payload and not list(tmp.rglob(".dl-*"))
+        staging = temp_path(tmp, ".zip")
+        assert staging.parent == tmp and staging.name.startswith(".dl-")
+        staging.unlink()
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
     assert safe_rel("../../etc/passwd") == "etc/passwd"
@@ -692,7 +749,17 @@ def selfcheck() -> None:
     print("selfcheck ok")
 
 
+def relax_stream_errors() -> None:
+    """Non-ASCII names must not crash printing on a narrow console encoding."""
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(errors="replace")
+        except (AttributeError, ValueError):
+            pass
+
+
 def main(argv: list[str] | None = None) -> int:
+    relax_stream_errors()
     ap = argparse.ArgumentParser(description="Download transfer.it links (concurrent, chunked, optional zip).")
     ap.add_argument("links", nargs="*", help="https://transfer.it/t/XXXXXXXXXXXX")
     ap.add_argument("-o", "--out", type=Path, default=Path("downloads"))
@@ -709,7 +776,7 @@ def main(argv: list[str] | None = None) -> int:
     install_fast_interrupt()
     if not args.links or args.jobs < 1 or args.chunk_size < 1:
         ap.error("need links; --jobs/--chunk-size >= 1")
-    xhs = [parse_xh(s) for s in args.links]
+    xhs = list(dict.fromkeys(parse_xh(s) for s in args.links))
     api = MegaAPI()
     args.out.mkdir(parents=True, exist_ok=True)
     link_workers = max(1, min(args.jobs, len(xhs)))
