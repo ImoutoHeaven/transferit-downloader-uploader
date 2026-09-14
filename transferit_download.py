@@ -495,7 +495,7 @@ def validate_tree(by_h: dict[str, dict]) -> str:
     """
     for handle, node in by_h.items():
         kind = node.get("t")
-        if isinstance(kind, bool) or kind not in (0, 1):
+        if type(kind) is not int or kind not in (0, 1):
             raise RuntimeError(f"malformed transfer tree: node {handle!r} has type {kind!r}")
     roots = {h for h, n in by_h.items() if n["t"] == 1 and not n.get("p")}
     if len(roots) != 1:
@@ -831,6 +831,8 @@ def selfcheck() -> None:
         ({**good, "z": {"h": "z", "p": "r", "name": "z", "t": "0"}}, "a string node type"),
         ({**good, "z": {"h": "z", "p": "r", "name": "z", "t": True}}, "a boolean node type"),
         ({**good, "z": {"h": "z", "p": "r", "name": "z", "t": 2}}, "an unknown node type"),
+        ({**good, "z": {"h": "z", "p": "r", "name": "z", "t": 0.0}}, "a float node type"),
+        ({**good, "r": {"h": "r", "p": "", "name": "root", "t": 1.0}}, "a float root type"),
         ({**good, "z": {"h": "z", "p": "f", "name": "z", "t": 0}}, "a file as parent"),
     ):
         try:
