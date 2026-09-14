@@ -465,7 +465,7 @@ def unlock(api: MegaAPI, xh: str, password: str) -> None:
 def resolve_rel(n: dict, by_h: dict[str, dict]) -> str:
     parts = [safe_name(n["name"])]
     seen = {n.get("h")}
-    p = n.get("p")
+    p = require_parent(n)
     while p and p in by_h:
         if p in seen:
             raise RuntimeError("malformed transfer tree: parent cycle")
@@ -485,12 +485,20 @@ def fold_key(name: str) -> str:
     return name.casefold() if os.name == "nt" else name
 
 
+def require_parent(n: dict) -> str:
+    """A file node always names the folder that holds it; only the transfer root is parentless."""
+    p = n.get("p")
+    if not p:
+        raise RuntimeError(f"malformed transfer tree: {(n.get('name') or n.get('h'))!r} has no parent folder")
+    return p
+
+
 def node_dirs(n: dict, by_h: dict[str, dict]) -> list[tuple[str, str]]:
     """(sanitized directory path, folder handle) for every ancestor of a file node."""
     names: list[str] = []  # innermost first
     handles: list[str] = []
     seen = {n.get("h")}
-    p = n.get("p")
+    p = require_parent(n)
     while p and p in by_h:
         if p in seen:
             raise RuntimeError("malformed transfer tree: parent cycle")
@@ -528,6 +536,7 @@ def load_nodes(
         if n.get("t"):
             continue
         n["rel"] = resolve_rel(n, by_h)
+        require_parent(n)
         for path, handle in node_dirs(n, by_h):
             dirs.setdefault(fold_key(path), set()).add(handle)
         files.append(n)
@@ -751,6 +760,19 @@ def selfcheck() -> None:
             raise AssertionError(f"dangling parent accepted by {fn.__name__}")
         except RuntimeError:
             pass
+    for orphan in ({"h": "f", "name": "x", "t": 0}, {"h": "f", "p": "", "name": "x", "t": 0}):
+        try:
+            require_parent(orphan)
+            raise AssertionError(f"parentless file accepted: {orphan}")
+        except RuntimeError:
+            pass
+        for fn in (resolve_rel, node_dirs):
+            try:
+                fn({**orphan, "name": "x"}, {"f": orphan})
+                raise AssertionError(f"parentless file accepted by {fn.__name__}")
+            except RuntimeError:
+                pass
+    assert require_parent({"p": "h"}) == "h"
     deep = {
         "r": {"h": "r", "p": "", "name": "root", "t": 1},
         "a": {"h": "a", "p": "r", "name": "a", "t": 1},
