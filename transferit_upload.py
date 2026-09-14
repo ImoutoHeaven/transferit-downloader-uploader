@@ -1103,6 +1103,28 @@ def selfcheck() -> None:
     assert needed_dirs(["root.txt", "a/b/c.txt", "a/x.txt"]) == ["a", "a/b"]
     assert parent_rel("a/b/c.txt") == "a/b" and parent_rel("x.txt") == ""
     assert publish(None, "x", False) is None  # type: ignore[arg-type]
+    # native encoder, when installed, must agree with the openssl reference on sizes that
+    # are not multiples of 16 and on files smaller than one MAC segment
+    if megacrypt is not None:
+        tmpdir = Path(tempfile.mkdtemp())
+        try:
+            for size in (0, 1, 6, 17, 100, (1 << 17) + 1):
+                blob = bytes((i * 7) % 251 for i in range(size))
+                p = tmpdir / f"s{size}.bin"
+                p.write_bytes(blob)
+                want_enc, want_key = encrypt_file(blob, ul_key) if blob else (b"", encrypt_file(b"", ul_key)[1])
+                cipher = megacrypt.FileCipher(str(p), size, ul_key, 1 << 20)
+                got = bytearray()
+                while True:
+                    piece = cipher.read(4096)
+                    if not piece:
+                        break
+                    got += piece
+                assert bytes(got) == want_enc, size
+                assert list(cipher.filekey or []) == want_key, size
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
     tmp = Path(tempfile.mkdtemp()) / "selfcheck-state.json"
     try:
         st = JobState(tmp, {"mode": "tree"})

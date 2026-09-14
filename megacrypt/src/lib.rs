@@ -50,7 +50,7 @@ fn read_full<R: Read + ?Sized>(src: &mut R, buf: &mut [u8]) -> std::io::Result<(
 }
 
 struct Core {
-    src: Box<dyn Read + Send>,
+    src: Box<dyn Read + Send + Sync>,
     key: Aes128,
     key_words: [u32; 6],
     ctr: Ctr128BE<Aes128>,
@@ -71,7 +71,7 @@ struct Core {
 
 impl Core {
     fn new(
-        src: Box<dyn Read + Send>,
+        src: Box<dyn Read + Send + Sync>,
         size: u64,
         ul_key: &[u32],
         chunk: usize,
@@ -203,9 +203,10 @@ impl Core {
             }
             let start = self.off;
             let want = std::cmp::min(self.chunk as u64, self.padded - start) as usize;
+            let real = std::cmp::min(want as u64, self.size.saturating_sub(start)) as usize;
             self.buf.resize(want, 0);
             let mut buf = std::mem::take(&mut self.buf);
-            read_full(&mut *self.src, &mut buf)?;
+            read_full(&mut *self.src, &mut buf[..real])?; // the tail beyond `size` stays zero padding
             let keep = std::cmp::min(want as u64, self.size.saturating_sub(start)) as usize;
             self.ct.resize(want, 0);
             self.ct.copy_from_slice(&buf);
@@ -241,7 +242,10 @@ pub fn encrypt_bytes_inner(data: &[u8], ul_key: &[u32], chunk: usize) -> Result<
 }
 
 /// Streaming encryptor over a file or any byte source.
-#[pyclass(module = "megacrypt", unsendable)]
+///
+/// `Core` is `Send + Sync` so PyO3 lets the Python object outlive its worker thread, which
+/// happens whenever a traceback keeps it alive past the upload thread.
+#[pyclass(module = "megacrypt")]
 pub struct FileCipher {
     core: Option<Core>,
 }
@@ -337,6 +341,26 @@ mod tests {
         assert_eq!(a, b);
         assert_eq!(ka, kb);
         assert_eq!(a.len(), data.len());
+    }
+
+    #[test]
+    fn streaming_source_pads_the_tail() {
+        for data in [b"short".as_slice(), b"", b"0123456789abcde", b"0123456789abcdef"] {
+            let mut core =
+                Core::new(Box::new(Cursor::new(data.to_vec())), data.len() as u64, &UL_KEY, 1 << 20).unwrap();
+            let mut out = Vec::new();
+            loop {
+                let piece = core.pull(4).unwrap();
+                if piece.is_empty() {
+                    break;
+                }
+                out.extend_from_slice(&piece);
+            }
+            core.finish();
+            let (want, want_key) = encrypt_bytes_inner(data, &UL_KEY, 1 << 20).unwrap();
+            assert_eq!(out, want, "{} bytes", data.len());
+            assert_eq!(core.filekey.unwrap(), want_key, "{} bytes", data.len());
+        }
     }
 
     #[test]
