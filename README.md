@@ -77,7 +77,8 @@ paths, prints `folder: link` for each folder that published, then the bare links
   ends the attempt.
 - The state JSON is validated when loaded; a malformed or half-written record stops the
   run with `error: ...` and a non-zero exit rather than being trusted.
-- Only folders holding direct files appear in the transfer.
+- Only folders holding direct files appear in the transfer; split mode targets those
+  folders, and tree mode creates the ancestor folders its relative paths need.
 
 ### Traces
 
@@ -123,7 +124,6 @@ python transferit_download.py --password "hunter2" https://transfer.it/t/XXXXXXX
 | `--zip` | | Packed download: the server zip when the transfer offers one, otherwise a local zip |
 | `--no-verify` | | Skip the chunk MAC check on decrypted files |
 | `--password` | | Plaintext password for password-protected links |
-
 Relative paths inside a link are recreated on disk; the packed mode keeps the same
 structure inside the archive. Intermediate directories are created as needed. Every range
 response is required to carry exactly the requested length, and each decrypted file is
@@ -131,8 +131,9 @@ checked against the chunk MAC in its file key (keys carrying per-chunk MACs from
 clients are skipped).
 
 Node names are reduced to a single safe path component, `.` and `..` members are dropped,
-and every write is verified to stay inside the destination directory; the same rule is
-applied to archive members, so a hostile transfer cannot place files elsewhere.
+and every write is verified to stay inside the destination directory. Two nodes that would
+land on the same path are refused, as is a server archive whose members would escape on
+extraction; members of the archive this tool builds are sanitized the same way.
 
 ## Encoder
 

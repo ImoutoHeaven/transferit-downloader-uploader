@@ -763,6 +763,22 @@ class JobState:
             atomic_write(self.path, self.data)
 
 
+def _is_int(value) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _check_files(path: Path, records) -> None:
+    if records is None:
+        return
+    if not isinstance(records, dict):
+        raise ValueError(f"{path}: file records must be an object")
+    for rel, meta in records.items():
+        if not isinstance(meta, dict) or not _is_int(meta.get("size")) or not _is_int(meta.get("mtime")):
+            raise ValueError(f"{path}: bad file record for {rel!r}")
+        if "done" in meta and not isinstance(meta["done"], bool):
+            raise ValueError(f"{path}: bad done flag for {rel!r}")
+
+
 def load_state(path: Path) -> dict | None:
     if not path.is_file():
         return None
@@ -771,12 +787,26 @@ def load_state(path: Path) -> dict | None:
         raise ValueError(f"{path}: state must be a JSON object")
     if data.get("mode") not in (None, "tree", "split"):
         raise ValueError(f"{path}: unknown mode {data.get('mode')!r}")
-    for rel, meta in (data.get("files") or {}).items():
-        if not isinstance(meta, dict) or not isinstance(meta.get("size"), int):
-            raise ValueError(f"{path}: bad file record for {rel!r}")
+    for key in ("closed", "root", "xh", "root_h"):
+        if key in data and not isinstance(data[key], bool if key == "closed" else str):
+            raise ValueError(f"{path}: bad {key!r}")
+    if bool(data.get("xh")) != bool(data.get("root_h")):
+        raise ValueError(f"{path}: transfer handle is incomplete")
+    if data.get("link") is not None and not isinstance(data["link"], str):
+        raise ValueError(f"{path}: bad link")
+    if data.get("closed") and not (data.get("link") and data.get("xh") and data.get("root_h")):
+        raise ValueError(f"{path}: closed state needs a published link and a transfer handle")
+    _check_files(path, data.get("files"))
     for key, job in (data.get("jobs") or {}).items():
-        if not isinstance(job, dict) or bool(job.get("xh")) != bool(job.get("root_h")):
+        if not isinstance(job, dict) or ("path" in job and not isinstance(job["path"], str)):
+            raise ValueError(f"{path}: bad job record for {key!r}")
+        if bool(job.get("xh")) != bool(job.get("root_h")):
             raise ValueError(f"{path}: job record for {key!r} is incomplete")
+        if job.get("link") is not None and not isinstance(job["link"], str):
+            raise ValueError(f"{path}: bad job link for {key!r}")
+        if job.get("closed") and not (job.get("link") and job.get("xh")):
+            raise ValueError(f"{path}: closed job for {key!r} needs a link and a transfer handle")
+        _check_files(path, job.get("files"))
     return data
 
 
@@ -1169,6 +1199,11 @@ def selfcheck() -> None:
             {"mode": "nope"},
             {"mode": "split", "jobs": {"a": {"xh": "x"}}},
             {"mode": "tree", "files": {"a.txt": {"size": "big"}}},
+            {"mode": "tree", "closed": True, "link": "arbitrary"},
+            {"mode": "tree", "closed": "yes", "xh": "a" * 12, "root_h": "b" * 8, "link": "l"},
+            {"mode": "tree", "files": {"a.txt": {"size": 1, "mtime": 0, "done": "false"}}},
+            {"mode": "tree", "xh": "a" * 12},
+            {"mode": "split", "jobs": {"a": {"closed": True, "link": "l"}}},
         ):
             tmp.write_text(json.dumps(bad), encoding="utf-8")
             try:
@@ -1176,6 +1211,23 @@ def selfcheck() -> None:
                 raise AssertionError(f"accepted bad state {bad}")
             except ValueError:
                 pass
+        ok = {
+            "mode": "tree",
+            "xh": "a" * 12,
+            "root_h": "b" * 8,
+            "closed": True,
+            "link": "https://transfer.it/t/" + "a" * 12,
+            "files": {"a.txt": {"size": 1, "mtime": 0, "done": True}},
+        }
+        tmp.write_text(json.dumps(ok), encoding="utf-8")
+        assert load_state(tmp)["link"].endswith("a" * 12)
+        bad_file = dict(ok, files={"a.txt": {"size": 1, "mtime": 0.5, "done": True}})
+        tmp.write_text(json.dumps(bad_file), encoding="utf-8")
+        try:
+            load_state(tmp)
+            raise AssertionError("accepted a fractional mtime")
+        except ValueError:
+            pass
         tmp.write_text(json.dumps({"mode": "split", "jobs": {"a": {"xh": "x", "root_h": "h"}}}), encoding="utf-8")
         assert load_state(tmp)["jobs"]["a"]["root_h"] == "h"
     finally:

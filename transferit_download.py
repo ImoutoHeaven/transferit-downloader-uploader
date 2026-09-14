@@ -9,6 +9,7 @@ import json
 import os
 import secrets
 import shutil
+import signal
 import struct
 import subprocess
 import sys
@@ -134,11 +135,14 @@ def mac_segment_ends(padded_len: int) -> list[int]:
 def verify_mac(plain: bytes, k: list[int]) -> bool:
     """Recompute the MEGA chunk MAC over `plain` and compare it with key words 6 and 7.
 
-    Keys carrying per-chunk MACs (more than 8 words) come from clients that chunk
-    differently, so there is nothing to compare against and the check passes.
+    Keys carrying extra per-chunk MACs (more than 8 words) come from clients that chunk
+    differently, so there is nothing to compare against and the check passes. A key with
+    fewer than 8 words is malformed for a file node and fails.
     """
-    if len(k) != 8:
+    if len(k) > 8:
         return True
+    if len(k) < 8:
+        return False
     key, _ = aes_key_iv(k)
     mac_iv = a32_to_bytes(k[4:6]) * 2
     padded = plain + b"\0" * (-len(plain) % 16)
@@ -160,6 +164,17 @@ def decrypt_verified(enc: bytes, k: list[int], verify: bool = True) -> bytes:
     if verify and not verify_mac(plain, k):
         raise RuntimeError("chunk MAC mismatch: downloaded bytes do not match the file key")
     return plain
+
+
+def install_fast_interrupt() -> None:
+    """Exit immediately on Ctrl+C; a stalled range request would otherwise hold the process."""
+
+    def _die(_sig, _frame):
+        os._exit(130)
+
+    signal.signal(signal.SIGINT, _die)
+    if hasattr(signal, "SIGBREAK"):
+        signal.signal(signal.SIGBREAK, _die)
 
 
 def _backoff(i: int) -> None:
@@ -216,12 +231,14 @@ def parse_xh(s: str) -> str:
     if "/t/" in s:
         s = s.rsplit("/t/", 1)[-1]
     s = s.split("?", 1)[0].strip("/")
-    if len(s) != 12:
+    if len(s) != 12 or not all(c.isalnum() or c in "-_" for c in s):
         raise ValueError(f"bad transfer.it link: {s}")
     return s
 
 
-WIN_RESERVED = {"CON", "PRN", "AUX", "NUL"} | {f"COM{i}" for i in range(1, 10)} | {f"LPT{i}" for i in range(1, 10)}
+WIN_RESERVED = {"CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$"}
+WIN_RESERVED |= {f"COM{i}" for i in range(1, 10)} | {f"LPT{i}" for i in range(1, 10)}
+WIN_RESERVED |= {f"COM{s}" for s in "\u00b9\u00b2\u00b3"} | {f"LPT{s}" for s in "\u00b9\u00b2\u00b3"}
 
 
 def safe_name(name: str) -> str:
@@ -229,8 +246,10 @@ def safe_name(name: str) -> str:
     name = name.replace("\\", "/").split("/")[-1].replace("\x00", "").strip()
     # ':' would introduce a Windows drive or stream path when joined onto a directory
     name = "".join(c for c in name if c.isprintable() and c != ":")
-    if set(name) <= {"."}:
-        name = "_" * len(name)
+    dots = name if set(name) <= {"."} else ""
+    name = name.rstrip(" .")  # Win32 drops trailing dots and spaces, aliasing other names
+    if dots:
+        name = "_" * max(1, len(dots))
     if name.split(".")[0].upper() in WIN_RESERVED:
         name = "_" + name
     return name or "file"
@@ -441,8 +460,12 @@ def unlock(api: MegaAPI, xh: str, password: str) -> None:
 
 def resolve_rel(n: dict, by_h: dict[str, dict]) -> str:
     parts = [safe_name(n["name"])]
+    seen = {n.get("h")}
     p = n.get("p")
     while p and p in by_h:
+        if p in seen:
+            raise RuntimeError("malformed transfer tree: parent cycle")
+        seen.add(p)
         parent = by_h[p]
         if parent.get("p") and parent.get("name"):
             parts.append(safe_name(parent["name"]))
@@ -475,8 +498,30 @@ def load_nodes(api: MegaAPI, xh: str, password: str | None = None) -> tuple[dict
 
 
 def save(path: Path, data: bytes) -> None:
+    """Write through a temporary name so a failed write leaves no partial final file."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_bytes(data)
+    tmp = path.with_name(path.name + ".part")
+    tmp.write_bytes(data)
+    os.replace(tmp, path)
+
+
+def unique_rels(files: list[dict]) -> None:
+    """Refuse transfers where two nodes would land on the same path after sanitizing."""
+    fold = (lambda s: s.casefold()) if os.name == "nt" else (lambda s: s)
+    seen: dict[str, str] = {}
+    for n in files:
+        key = fold(safe_rel(n["rel"]))
+        if key in seen:
+            raise RuntimeError(f"two nodes map to the same path: {seen[key]!r} and {n['rel']!r}")
+        seen[key] = n["rel"]
+
+
+def zip_members_safe(path: Path) -> None:
+    """Reject a server-packed archive whose members would escape on extraction."""
+    with zipfile.ZipFile(path) as zf:
+        for name in zf.namelist():
+            if not name.endswith("/") and safe_rel(name) != name.replace("\\", "/"):
+                raise RuntimeError(f"unsafe archive member in server zip: {name!r}")
 
 
 def download_transfer(
@@ -497,20 +542,29 @@ def download_transfer(
     per_file = split_jobs(jobs, workers)
     if packed:
         if z:
+            name = f"{xh}{safe_name(str(z))}.zip"
+            path = dest / name
+            if not under(dest, path):
+                raise RuntimeError(f"refusing to write outside {dest}: {name!r}")
             url, size = g_url(api, xh, z, plain=True)
             data = download_blob(url, size, chunk, jobs, kind="http")
-            path = dest / f"{xh}{z}.zip"
             save(path, data)
+            zip_members_safe(path)
             return [path]
+        unique_rels(files)
         buf = dest / f"{xh}.zip"
-        with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_STORED) as zf:
+        tmp = buf.with_name(buf.name + ".part")
+        with zipfile.ZipFile(tmp, "w", compression=zipfile.ZIP_STORED) as zf:
             def one(n):
                 url, size = g_url(api, xh, n["h"], plain=False)
                 enc = download_blob(url, size or n.get("s") or 0, chunk, per_file, kind="mega")
                 return n["rel"], decrypt_verified(enc, n["k"], verify)
             for rel, data in queue_run(files, one, workers):
                 zf.writestr(safe_rel(rel), data)
+        os.replace(tmp, buf)
         return [buf]
+
+    unique_rels(files)
 
     def one(n):
         url, size = g_url(api, xh, n["h"], plain=False)
@@ -533,6 +587,7 @@ def selfcheck() -> None:
     assert not verify_mac(b"hello transfer.it e2e\r", k)
     flipped = bytes([enc[0] ^ 1]) + enc[1:]
     assert not verify_mac(decrypt_file(flipped, k), k)
+    assert verify_mac(b"", [0] * 4) is False and verify_mac(b"", [0] * 7) is False
     try:
         decrypt_verified(flipped, k)
         raise AssertionError("corrupted ciphertext accepted")
@@ -570,6 +625,54 @@ def selfcheck() -> None:
     assert safe_name("nul\x00l") == "null" and safe_name("   ") == "file"
     assert safe_name("C:evil") == "Cevil" and safe_name("nul") == "_nul" and safe_name("COM1.txt") == "_COM1.txt"
     assert safe_name("12:30 mix.mp3") == "1230 mix.mp3" and safe_name("plain name.mp4") == "plain name.mp4"
+    assert safe_name("file.") == "file" and safe_name("CONOUT$") == "_CONOUT$" and safe_name("COM\u00b9") == "_COM\u00b9"
+    try:
+        parse_xh("../../escape")
+        raise AssertionError("path-like transfer id accepted")
+    except ValueError:
+        pass
+    assert parse_xh("https://transfer.it/t/z5ImA2wjUToI") == "z5ImA2wjUToI"
+    cycle = {
+        "a": {"h": "a", "p": "b", "name": "a", "t": 1},
+        "b": {"h": "b", "p": "a", "name": "b", "t": 1},
+        "f": {"h": "f", "p": "a", "name": "f", "t": 0},
+    }
+    try:
+        resolve_rel(cycle["f"], cycle)
+        raise AssertionError("cyclic tree accepted")
+    except RuntimeError:
+        pass
+    unique_rels([{"rel": "a.txt"}, {"rel": "b.txt"}, {"rel": "dir/c.txt"}])
+    try:
+        unique_rels([{"rel": "ab"}, {"rel": "a:b"}])
+        raise AssertionError("collision not reported")
+    except RuntimeError:
+        pass
+    try:
+        unique_rels([{"rel": "dup.txt"}, {"rel": "dup.txt"}])
+        raise AssertionError("duplicate node not reported")
+    except RuntimeError:
+        pass
+    tmp = Path(tempfile.mkdtemp())
+    try:
+        payload = b"payload"
+        bad_zip = tmp / "bad.zip"
+        with zipfile.ZipFile(bad_zip, "w") as zf:
+            zf.writestr("../payload", payload)
+        try:
+            zip_members_safe(bad_zip)
+            raise AssertionError("traversal member accepted")
+        except RuntimeError:
+            pass
+        good_zip = tmp / "good.zip"
+        with zipfile.ZipFile(good_zip, "w") as zf:
+            zf.writestr("dir/payload", payload)
+        zip_members_safe(good_zip)
+        target = tmp / "sub" / "file.bin"
+        save(target, payload)
+        assert target.read_bytes() == payload and not list(tmp.rglob("*.part"))
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
     assert safe_rel("../../etc/passwd") == "etc/passwd"
     assert safe_rel("a/../b") == "a/b"
     hostile = {
@@ -584,6 +687,8 @@ def selfcheck() -> None:
         assert under(dest, dest / safe_rel(rel)) and not under(dest, dest / "../escaped")
     finally:
         shutil.rmtree(dest, ignore_errors=True)
+    install_fast_interrupt()
+    assert signal.getsignal(signal.SIGINT).__name__ == "_die"
     print("selfcheck ok")
 
 
@@ -601,6 +706,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.selfcheck:
         selfcheck()
         return 0
+    install_fast_interrupt()
     if not args.links or args.jobs < 1 or args.chunk_size < 1:
         ap.error("need links; --jobs/--chunk-size >= 1")
     xhs = [parse_xh(s) for s in args.links]

@@ -65,6 +65,8 @@ struct Core {
     cond: Block,
     buf: Vec<u8>,
     ct: Vec<u8>,
+    pending: Vec<u8>,
+    pending_pos: usize,
     done: bool,
     filekey: Option<[u32; 8]>,
 }
@@ -120,6 +122,8 @@ impl Core {
             cond: Default::default(),
             buf: Vec::new(),
             ct: Vec::new(),
+            pending: Vec::new(),
+            pending_pos: 0,
             done: false,
             filekey: None,
         })
@@ -195,29 +199,42 @@ impl Core {
 
     /// Produce up to `n` ciphertext bytes, encrypting whole chunks as needed.
     fn pull(&mut self, n: usize) -> std::io::Result<Vec<u8>> {
-        let mut out: Vec<u8> = Vec::with_capacity(n);
+        let mut out: Vec<u8> = Vec::with_capacity(n.min(1 << 20));
         while out.len() < n {
+            if self.pending_pos < self.pending.len() {
+                let take = std::cmp::min(n - out.len(), self.pending.len() - self.pending_pos);
+                out.extend_from_slice(&self.pending[self.pending_pos..self.pending_pos + take]);
+                self.pending_pos += take;
+                continue;
+            }
             if self.off >= self.padded {
                 self.finish();
                 break;
             }
-            let start = self.off;
-            let want = std::cmp::min(self.chunk as u64, self.padded - start) as usize;
-            let real = std::cmp::min(want as u64, self.size.saturating_sub(start)) as usize;
-            self.buf.resize(want, 0);
-            let mut buf = std::mem::take(&mut self.buf);
-            read_full(&mut *self.src, &mut buf[..real])?;
-            buf[real..want].fill(0); // bytes past `size` are zero padding, never the previous chunk
-            let keep = std::cmp::min(want as u64, self.size.saturating_sub(start)) as usize;
-            self.ct.resize(want, 0);
-            self.ct.copy_from_slice(&buf);
-            self.ctr.apply_keystream(&mut self.ct);
-            out.extend_from_slice(&self.ct[..keep]);
-            self.feed_mac(&buf);
-            self.buf = buf;
-            self.off = start + want as u64;
+            self.fill()?;
         }
         Ok(out)
+    }
+
+    /// Encrypt one internal chunk into `pending`.
+    fn fill(&mut self) -> std::io::Result<()> {
+        let start = self.off;
+        let want = std::cmp::min(self.chunk as u64, self.padded - start) as usize;
+        let real = std::cmp::min(want as u64, self.size.saturating_sub(start)) as usize;
+        self.buf.resize(want, 0);
+        let mut buf = std::mem::take(&mut self.buf);
+        read_full(&mut *self.src, &mut buf[..real])?;
+        buf[real..want].fill(0); // bytes past `size` are zero padding, never the previous chunk
+        self.ct.resize(want, 0);
+        self.ct.copy_from_slice(&buf);
+        self.ctr.apply_keystream(&mut self.ct);
+        self.pending.clear();
+        self.pending.extend_from_slice(&self.ct[..real]);
+        self.pending_pos = 0;
+        self.feed_mac(&buf);
+        self.buf = buf;
+        self.off = start + want as u64;
+        Ok(())
     }
 }
 
@@ -371,6 +388,27 @@ mod tests {
             assert_eq!(small, big, "size {size} chunk {chunk}");
             assert_eq!(key_small, key_big, "size {size} chunk {chunk}");
         }
+    }
+
+    #[test]
+    fn read_returns_at_most_requested() {
+        let data: Vec<u8> = (0..5000u32).map(|i| (i % 251) as u8).collect();
+        let mut core = Core::new(Box::new(Cursor::new(data.clone())), data.len() as u64, &UL_KEY, 4096).unwrap();
+        assert_eq!(core.pull(1).unwrap().len(), 1);
+        assert_eq!(core.pull(7).unwrap().len(), 7);
+        assert_eq!(core.pull(200).unwrap().len(), 200);
+        let mut rest = Vec::new();
+        loop {
+            let piece = core.pull(1000).unwrap();
+            assert!(piece.len() <= 1000);
+            if piece.is_empty() {
+                break;
+            }
+            rest.extend_from_slice(&piece);
+        }
+        let (want, want_key) = encrypt_bytes_inner(&data, &UL_KEY, 4096).unwrap();
+        assert_eq!(rest.len(), want.len() - 208);
+        assert_eq!(core.filekey.unwrap(), want_key);
     }
 
     #[test]
