@@ -206,7 +206,8 @@ impl Core {
             let real = std::cmp::min(want as u64, self.size.saturating_sub(start)) as usize;
             self.buf.resize(want, 0);
             let mut buf = std::mem::take(&mut self.buf);
-            read_full(&mut *self.src, &mut buf[..real])?; // the tail beyond `size` stays zero padding
+            read_full(&mut *self.src, &mut buf[..real])?;
+            buf[real..want].fill(0); // bytes past `size` are zero padding, never the previous chunk
             let keep = std::cmp::min(want as u64, self.size.saturating_sub(start)) as usize;
             self.ct.resize(want, 0);
             self.ct.copy_from_slice(&buf);
@@ -223,10 +224,7 @@ impl Core {
 /// MEGA file encryption of an in-memory buffer: returns (ciphertext, file key words).
 pub fn encrypt_bytes_inner(data: &[u8], ul_key: &[u32], chunk: usize) -> Result<(Vec<u8>, [u32; 8]), String> {
     let chunk = chunk.max(AES_BLOCK as usize);
-    let padded = data.len().div_ceil(16) * 16;
-    let mut src = data.to_vec();
-    src.resize(padded, 0); // the MAC sees the zero-padded tail
-    let mut core = Core::new(Box::new(Cursor::new(src)), data.len() as u64, ul_key, chunk)?;
+    let mut core = Core::new(Box::new(Cursor::new(data.to_vec())), data.len() as u64, ul_key, chunk)?;
     let mut out = Vec::with_capacity(data.len());
     while out.len() < data.len() {
         let piece = core.pull(std::cmp::min(core.chunk, data.len() - out.len())).map_err(|e| e.to_string())?;
@@ -360,6 +358,18 @@ mod tests {
             let (want, want_key) = encrypt_bytes_inner(data, &UL_KEY, 1 << 20).unwrap();
             assert_eq!(out, want, "{} bytes", data.len());
             assert_eq!(core.filekey.unwrap(), want_key, "{} bytes", data.len());
+        }
+    }
+
+    #[test]
+    fn padding_never_reuses_the_previous_chunk() {
+        // the final chunk is short and unaligned: its padding must be zeros, not the tail of chunk 1
+        for (size, chunk) in [(17usize, 16usize), (4097, 1024), (0x20000 + 1, 0x10000), (37, 16)] {
+            let data: Vec<u8> = (0..size).map(|i| (i % 251) as u8).collect();
+            let (small, key_small) = encrypt_bytes_inner(&data, &UL_KEY, chunk).unwrap();
+            let (big, key_big) = encrypt_bytes_inner(&data, &UL_KEY, 1 << 20).unwrap();
+            assert_eq!(small, big, "size {size} chunk {chunk}");
+            assert_eq!(key_small, key_big, "size {size} chunk {chunk}");
         }
     }
 

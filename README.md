@@ -45,7 +45,7 @@ python transferit_upload.py -v --state job.json /data/2026-08       # phase log 
 | --- | --- | --- |
 | `--mode tree` | yes | One link for the whole folder, relative paths preserved |
 | `--mode split` | | One link per folder containing direct files |
-| `-j, --jobs` | 4 | Files uploaded in parallel |
+| `-j, --jobs` | 4 | Total concurrent uploads, shared across folders |
 | `--state` | `.transferit-upload.json` | Resume file, written atomically and kept out of the transfer |
 | `-v, --verbose` | | Timestamped phase log on stderr with a stall watchdog |
 | `--chunk-mib` | 8 | Streaming encrypt/read chunk per file |
@@ -70,9 +70,13 @@ paths, prints `folder: link` for each folder that published, then the bare links
   and the socket buffer. Per in-flight file, budget roughly three times the chunk for
   encryption plus one 32 MiB write buffer.
 - Socket writes carry 32 MiB each, which roughly halves wall clock against 8 KiB writes.
+- `-j` bounds total concurrency: split mode divides it between folder workers and the
+  file workers inside each folder.
 - The per-request socket timeout is `max(120, size / 256KiB)` seconds, measured as
   inactivity on the socket, so a large file gets a generous window while a silent peer
   ends the attempt.
+- The state JSON is validated when loaded; a malformed or half-written record stops the
+  run with `error: ...` and a non-zero exit rather than being trusted.
 - Only folders holding direct files appear in the transfer.
 
 ### Traces
@@ -114,13 +118,21 @@ python transferit_download.py --password "hunter2" https://transfer.it/t/XXXXXXX
 | Flag | Default | Meaning |
 | --- | --- | --- |
 | `-o, --out` | `downloads` | Output root; each link writes under `<out>/<link id>/` |
-| `-j, --jobs` | 4 | Links and byte ranges fetched in parallel |
+| `-j, --jobs` | 4 | Total concurrent requests, shared across links, files and ranges |
 | `--chunk-size` | 1 MiB | Byte range size per range request |
 | `--zip` | | Packed download: the server zip when the transfer offers one, otherwise a local zip |
+| `--no-verify` | | Skip the chunk MAC check on decrypted files |
 | `--password` | | Plaintext password for password-protected links |
 
 Relative paths inside a link are recreated on disk; the packed mode keeps the same
-structure inside the archive. The intermediate directories are created as needed.
+structure inside the archive. Intermediate directories are created as needed. Every range
+response is required to carry exactly the requested length, and each decrypted file is
+checked against the chunk MAC in its file key (keys carrying per-chunk MACs from other
+clients are skipped).
+
+Node names are reduced to a single safe path component, `.` and `..` members are dropped,
+and every write is verified to stay inside the destination directory; the same rule is
+applied to archive members, so a hostile transfer cannot place files elsewhere.
 
 ## Encoder
 
@@ -174,9 +186,9 @@ Measured on 8-core hosts, 128 MiB file, one run each:
 ## Verification
 
 ```sh
-python transferit_upload.py --selfcheck       # cipher vectors, MAC boundaries, state, interrupts
-python transferit_download.py --selfcheck     # decryption vectors, ranges, queue
-cd megacrypt && cargo test --release          # cipher vectors and segment ramp in Rust
+python transferit_upload.py --selfcheck       # cipher vectors, MAC boundaries, native vs openssl, state, interrupts
+python transferit_download.py --selfcheck     # decryption and MAC vectors, ranges, hostile names, queue
+cd megacrypt && cargo test --release          # cipher vectors, segment ramp, tail padding
 ```
 
 Linux builds, encoder equivalence, throughput, and a real upload/download round trip run

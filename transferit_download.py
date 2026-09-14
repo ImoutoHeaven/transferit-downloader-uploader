@@ -8,9 +8,11 @@ import hashlib
 import json
 import os
 import secrets
+import shutil
 import struct
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import zipfile
@@ -113,6 +115,53 @@ def decrypt_file(enc: bytes, k: list[int]) -> bytes:
     return openssl_aes("ctr", key, enc, iv, decrypt=True)[: len(enc)]
 
 
+MAC_RAMP = (0x20000, 0x60000, 0xC0000, 0x140000, 0x1E0000, 0x2A0000, 0x380000)
+MAC_STEADY = 0x480000
+MAC_MAX = 0x100000
+
+
+def mac_segment_ends(padded_len: int) -> list[int]:
+    """MEGA chunk-MAC boundaries for a zero-padded length."""
+    ends = [p for p in MAC_RAMP if p < padded_len]
+    pos = MAC_STEADY
+    while pos < padded_len:
+        ends.append(pos)
+        pos += MAC_MAX
+    ends.append(padded_len)
+    return ends
+
+
+def verify_mac(plain: bytes, k: list[int]) -> bool:
+    """Recompute the MEGA chunk MAC over `plain` and compare it with key words 6 and 7.
+
+    Keys carrying per-chunk MACs (more than 8 words) come from clients that chunk
+    differently, so there is nothing to compare against and the check passes.
+    """
+    if len(k) != 8:
+        return True
+    key, _ = aes_key_iv(k)
+    mac_iv = a32_to_bytes(k[4:6]) * 2
+    padded = plain + b"\0" * (-len(plain) % 16)
+    cond = [0, 0, 0, 0]
+    start = 0
+    for end in mac_segment_ends(len(padded)):
+        seg = padded[start:end]
+        start = end
+        mac = openssl_aes("cbc", key, seg, mac_iv)[-16:] if seg else mac_iv
+        words = bytes_to_a32(mac)
+        mixed = a32_to_bytes([c ^ w for c, w in zip(cond, words)])
+        cond = bytes_to_a32(openssl_aes("ecb", key, mixed)[:16])
+    return cond[0] ^ cond[1] == k[6] and cond[2] ^ cond[3] == k[7]
+
+
+def decrypt_verified(enc: bytes, k: list[int], verify: bool = True) -> bytes:
+    """Decrypt and, when the key carries a meta MAC, refuse data that fails it."""
+    plain = decrypt_file(enc, k)
+    if verify and not verify_mac(plain, k):
+        raise RuntimeError("chunk MAC mismatch: downloaded bytes do not match the file key")
+    return plain
+
+
 def _backoff(i: int) -> None:
     time.sleep(min(8.0, 0.5 * (2**i)) + secrets.randbelow(250) / 1000.0)
 
@@ -173,8 +222,24 @@ def parse_xh(s: str) -> str:
 
 
 def safe_name(name: str) -> str:
+    """One path component, never a traversal token."""
     name = name.replace("\\", "/").split("/")[-1].replace("\x00", "").strip()
+    name = "".join(c for c in name if c.isprintable() and c not in '<>:"|?*')
+    if set(name) <= {"."}:
+        name = "_" * len(name)
     return name or "file"
+
+
+def safe_rel(rel: str) -> str:
+    """Join cleaned components, dropping `.`, `..` and empty members."""
+    parts = [safe_name(raw) for raw in rel.replace("\\", "/").split("/") if raw not in ("", ".", "..")]
+    return "/".join(parts) or "file"
+
+
+def under(root: Path, path: Path) -> bool:
+    """True when `path` stays inside `root` after resolution."""
+    root_s, path_s = str(root.resolve()), str(path.resolve())
+    return path_s == root_s or path_s.startswith(root_s.rstrip("/\\") + os.sep)
 
 
 def ranges(size: int, chunk: int) -> list[tuple[int, int]]:
@@ -187,6 +252,11 @@ def ranges(size: int, chunk: int) -> list[tuple[int, int]]:
         out.append((i, j))
         i = j + 1
     return out
+
+
+def split_jobs(total: int, parallel: int) -> int:
+    """Workers to give each parallel unit so the product stays within `total`."""
+    return max(1, total // max(1, parallel))
 
 
 def queue_run(items: list, fn, jobs: int, attempts: int = ATTEMPTS) -> list:
@@ -338,16 +408,17 @@ def download_blob(url: str, size: int, chunk: int, jobs: int, kind: str) -> byte
     rs = ranges(size, chunk)
     if not rs:
         return b""
-    if len(rs) == 1:
-        data = retry(lambda: fetch_range(url, rs[0][0], rs[0][1], kind))
-        return data[:size] if kind == "http" else data
 
     def one(se):
         a, b = se
-        return retry(lambda: fetch_range(url, a, b, kind))
+        data = retry(lambda: fetch_range(url, a, b, kind))
+        if kind == "http" and len(data) != b - a + 1:
+            raise Retry(f"range {a}-{b}: got {len(data)} bytes")
+        return data
 
-    parts = queue_run(rs, one, jobs)
-    blob = b"".join(parts)
+    if len(rs) == 1:
+        return one(rs[0])[:size]
+    blob = b"".join(queue_run(rs, one, jobs))
     return blob[:size]
 
 
@@ -363,12 +434,12 @@ def unlock(api: MegaAPI, xh: str, password: str) -> None:
 
 
 def resolve_rel(n: dict, by_h: dict[str, dict]) -> str:
-    parts = [n["name"]]
+    parts = [safe_name(n["name"])]
     p = n.get("p")
     while p and p in by_h:
         parent = by_h[p]
         if parent.get("p") and parent.get("name"):
-            parts.append(parent["name"])
+            parts.append(safe_name(parent["name"]))
         p = parent.get("p")
     parts.reverse()
     return "/".join(parts)
@@ -403,12 +474,21 @@ def save(path: Path, data: bytes) -> None:
 
 
 def download_transfer(
-    api: MegaAPI, xh: str, dest: Path, jobs: int, chunk: int, packed: bool, password: str | None = None
+    api: MegaAPI,
+    xh: str,
+    dest: Path,
+    jobs: int,
+    chunk: int,
+    packed: bool,
+    password: str | None = None,
+    verify: bool = True,
 ) -> list[Path]:
     info, files = load_nodes(api, xh, password)
     dest.mkdir(parents=True, exist_ok=True)
     z = info.get("z") if isinstance(info, dict) else None
     written: list[Path] = []
+    workers = max(1, min(jobs, len(files))) if files else 1
+    per_file = split_jobs(jobs, workers)
     if packed:
         if z:
             url, size = g_url(api, xh, z, plain=True)
@@ -420,20 +500,22 @@ def download_transfer(
         with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_STORED) as zf:
             def one(n):
                 url, size = g_url(api, xh, n["h"], plain=False)
-                enc = download_blob(url, size or n.get("s") or 0, chunk, jobs, kind="mega")
-                return n["rel"], decrypt_file(enc, n["k"])
-            for rel, data in queue_run(files, one, jobs):
-                zf.writestr(rel, data)
+                enc = download_blob(url, size or n.get("s") or 0, chunk, per_file, kind="mega")
+                return n["rel"], decrypt_verified(enc, n["k"], verify)
+            for rel, data in queue_run(files, one, workers):
+                zf.writestr(safe_rel(rel), data)
         return [buf]
 
     def one(n):
         url, size = g_url(api, xh, n["h"], plain=False)
-        enc = download_blob(url, size or n.get("s") or 0, chunk, jobs, kind="mega")
-        path = dest / n["rel"]
-        save(path, decrypt_file(enc, n["k"]))
+        enc = download_blob(url, size or n.get("s") or 0, chunk, per_file, kind="mega")
+        path = dest / safe_rel(n["rel"])
+        if not under(dest, path):
+            raise RuntimeError(f"refusing to write outside {dest}: {n['rel']!r}")
+        save(path, decrypt_verified(enc, n["k"], verify))
         return path
 
-    written = queue_run(files, one, jobs)
+    written = queue_run(files, one, workers)
     return written
 
 
@@ -441,9 +523,20 @@ def selfcheck() -> None:
     enc = bytes.fromhex("33d20a2fdd011ec6d9d07254610b79126531d459a821")
     k = [527450335, 1773456421, 2848265909, 1494836302, 956789286, 1404853608, 551298358, 4078008913]
     assert decrypt_file(enc, k) == b"hello transfer.it e2e\n"
+    assert verify_mac(b"hello transfer.it e2e\n", k)
+    assert not verify_mac(b"hello transfer.it e2e\r", k)
+    flipped = bytes([enc[0] ^ 1]) + enc[1:]
+    assert not verify_mac(decrypt_file(flipped, k), k)
+    try:
+        decrypt_verified(flipped, k)
+        raise AssertionError("corrupted ciphertext accepted")
+    except RuntimeError:
+        pass
+    assert verify_mac(b"", k + [0, 0])  # per-chunk keys are skipped
     at = "Nw-u-ZTbw_9vRD2AIxhVuZVZaxzCOoaTu90_-KWvyCA"
     assert decrypt_attr(at, k)["n"] == "hello.txt"
     assert ranges(22, 8) == [(0, 7), (8, 15), (16, 21)]
+    assert [split_jobs(4, n) for n in (1, 2, 4, 8)] == [4, 2, 1, 1]
     n = [0]
 
     def flaky():
@@ -465,6 +558,24 @@ def selfcheck() -> None:
         "f": {"h": "f", "p": "s2", "name": "file.txt", "t": 0},
     }
     assert resolve_rel(mock_tree["f"], mock_tree) == "sub1/sub2/file.txt"
+
+    # hostile node names must stay inside the output directory
+    assert safe_name("..") == "__" and safe_name(".") == "_" and safe_name("a/b") == "b"
+    assert safe_name("nul\x00l") == "null" and safe_name("   ") == "file"
+    assert safe_rel("../../etc/passwd") == "etc/passwd"
+    assert safe_rel("a/../b") == "a/b"
+    hostile = {
+        "r": {"h": "r", "p": "", "name": "root", "t": 1},
+        "up": {"h": "up", "p": "r", "name": "..", "t": 1},
+        "x": {"h": "x", "p": "up", "name": "..\\payload", "t": 0},
+    }
+    rel = resolve_rel(hostile["x"], hostile)
+    assert rel == "__/payload", rel
+    dest = Path(tempfile.mkdtemp())
+    try:
+        assert under(dest, dest / safe_rel(rel)) and not under(dest, dest / "../escaped")
+    finally:
+        shutil.rmtree(dest, ignore_errors=True)
     print("selfcheck ok")
 
 
@@ -476,6 +587,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--chunk-size", type=int, default=1 << 20)
     ap.add_argument("--zip", action="store_true", help="packed download (server zip if available)")
     ap.add_argument("--password", default=None, help="plaintext password for xv-protected links")
+    ap.add_argument("--no-verify", action="store_true", help="skip the chunk MAC check on decrypted files")
     ap.add_argument("--selfcheck", action="store_true")
     args = ap.parse_args(argv)
     if args.selfcheck:
@@ -486,13 +598,17 @@ def main(argv: list[str] | None = None) -> int:
     xhs = [parse_xh(s) for s in args.links]
     api = MegaAPI()
     args.out.mkdir(parents=True, exist_ok=True)
+    link_workers = max(1, min(args.jobs, len(xhs)))
+    per_link = split_jobs(args.jobs, link_workers)
 
     def one(xh: str):
         dest = args.out / xh
-        paths = download_transfer(api, xh, dest, args.jobs, args.chunk_size, args.zip, args.password)
+        paths = download_transfer(
+            api, xh, dest, per_link, args.chunk_size, args.zip, args.password, not args.no_verify
+        )
         return xh, paths
 
-    results = queue_run(xhs, one, args.jobs)
+    results = queue_run(xhs, one, link_workers)
     for xh, paths in results:
         for p in paths:
             print(f"{xh}: {p}")

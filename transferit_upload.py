@@ -710,21 +710,31 @@ def needed_dirs(file_rels: list[str]) -> list[str]:
     return sorted(needed, key=lambda s: s.count("/"))
 
 
+def split_jobs(total: int, parallel: int) -> int:
+    """Workers to give each parallel unit so the product stays within `total`."""
+    return max(1, total // max(1, parallel))
+
+
 def collect_split(paths: list[Path], skip: set[Path]) -> list[tuple[str, Path, list[Path]]]:
     skip = {p.resolve() for p in skip}
     out: list[tuple[str, Path, list[Path]]] = []
+    seen: set[Path] = set()
     for p in paths:
         p = p.resolve()
         if p.is_file():
-            if p not in skip:
+            if p not in skip and p not in seen:
+                seen.add(p)
                 out.append(("file", p, [p]))
             continue
         if not p.is_dir():
             raise FileNotFoundError(p)
         for dirpath, _dns, filenames in os.walk(p):
             d = Path(dirpath)
+            if d in seen:
+                continue
             files = [d / fn for fn in filenames if (d / fn).is_file() and (d / fn).resolve() not in skip]
             if files:
+                seen.add(d)
                 out.append(("dir", d, files))
     return out
 
@@ -740,7 +750,10 @@ class JobState:
     def __init__(self, path: Path, data: dict):
         self.path = path.resolve()
         self.data = data
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()  # mutations and saves share one reentrant lock
+
+    def lock(self) -> threading.RLock:
+        return self._lock
 
     def save(self, api: MegaAPI | None = None) -> None:
         with self._lock:
@@ -753,7 +766,18 @@ class JobState:
 def load_state(path: Path) -> dict | None:
     if not path.is_file():
         return None
-    return json.loads(path.read_text(encoding="utf-8"))
+    data = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(data, dict):
+        raise ValueError(f"{path}: state must be a JSON object")
+    if data.get("mode") not in (None, "tree", "split"):
+        raise ValueError(f"{path}: unknown mode {data.get('mode')!r}")
+    for rel, meta in (data.get("files") or {}).items():
+        if not isinstance(meta, dict) or not isinstance(meta.get("size"), int):
+            raise ValueError(f"{path}: bad file record for {rel!r}")
+    for key, job in (data.get("jobs") or {}).items():
+        if not isinstance(job, dict) or bool(job.get("xh")) != bool(job.get("root_h")):
+            raise ValueError(f"{path}: job record for {key!r} is incomplete")
+    return data
 
 
 def bind_api(state: dict) -> MegaAPI:
@@ -811,7 +835,7 @@ def upload_pending(
 ) -> list[BaseException]:
     pending = [(rel, path, parent) for rel, path, parent in items if stale(files_meta.get(rel) or {}, path)]
     errors: list[BaseException] = []
-    lock = threading.Lock()
+    lock = state.lock()  # serialises every state mutation and save
     own = False
     if not pending:
         return errors
@@ -913,33 +937,38 @@ def run_split(paths: list[Path], state: JobState, jobs: int) -> tuple[list[tuple
     def one_target(item):
         kind, folder, files = item
         key = str(folder.resolve())
-        job = jobs_d.setdefault(key, {"kind": kind, "path": key})
+        with state.lock():
+            job = jobs_d.setdefault(key, {"kind": kind, "path": key})
         if job.get("closed") and job.get("link"):
             log(f"{folder}: already closed, reusing {job['link']}")
             return folder, job["link"]
         if not job.get("xh"):
             h, xh = create_transfer(api, folder.name or "transfer")
-            job["xh"], job["root_h"] = xh, h
-            state.save(api)
+            with state.lock():
+                job.update({"xh": xh, "root_h": h, "files": job.get("files") or {}})
+                state.save(api)
             log(f"{folder}: transfer created xh={xh}")
         else:
             log(f"{folder}: resuming transfer xh={job['xh']}")
-        files_meta = job.setdefault("files", {})
+        with state.lock():
+            files_meta = job.setdefault("files", {})
         items = []
         for f in files:
             rel = f.name
-            files_meta.setdefault(rel, file_meta(f))
+            with state.lock():
+                files_meta.setdefault(rel, file_meta(f))
             items.append((rel, f, job["root_h"]))
-        err = upload_pending(api, items, files_meta, state, jobs, bar=bar)
+        err = upload_pending(api, items, files_meta, state, per_target, bar=bar)
         if err or any(stale(files_meta.get(f.name) or {}, f) for f in files):
             state.save(api)
             log(f"{folder}: fail-closed, no link generated")
             raise RuntimeError(err[0] if err else "incomplete")
         log(f"{folder}: all files uploaded; closing transfer (xc)")
         link = publish(api, job["xh"], True)
-        job["closed"] = True
-        job["link"] = link
-        state.save(api)
+        with state.lock():
+            job["closed"] = True
+            job["link"] = link
+            state.save(api)
         return folder, link
 
     n_pending = 0
@@ -951,8 +980,9 @@ def run_split(paths: list[Path], state: JobState, jobs: int) -> tuple[list[tuple
         meta = job.get("files") or {}
         n_pending += sum(1 for f in files if stale(meta.get(f.name) or {}, f))
     bar = tqdm(total=n_pending, unit="file", desc="upload", leave=True, disable=VERBOSE)
-    log(f"mode=split targets={len(targets)} pending_files={n_pending}")
     workers = max(1, min(jobs, len(targets)))
+    per_target = split_jobs(jobs, workers)
+    log(f"mode=split targets={len(targets)} pending_files={n_pending} workers={workers} per_folder={per_target}")
     ex = ThreadPoolExecutor(max_workers=workers)
     futs = [ex.submit(one_target, t) for t in targets]
     try:
@@ -1102,26 +1132,28 @@ def selfcheck() -> None:
     assert handle_of(raw) == b64u_encode(raw) != raw.decode("latin1")
     assert needed_dirs(["root.txt", "a/b/c.txt", "a/x.txt"]) == ["a", "a/b"]
     assert parent_rel("a/b/c.txt") == "a/b" and parent_rel("x.txt") == ""
+    assert [split_jobs(4, n) for n in (1, 2, 4, 8)] == [4, 2, 1, 1] and split_jobs(1, 4) == 1
     assert publish(None, "x", False) is None  # type: ignore[arg-type]
     # native encoder, when installed, must agree with the openssl reference on sizes that
     # are not multiples of 16 and on files smaller than one MAC segment
     if megacrypt is not None:
         tmpdir = Path(tempfile.mkdtemp())
         try:
-            for size in (0, 1, 6, 17, 100, (1 << 17) + 1):
+            cases = ((0, 1 << 20), (1, 4096), (6, 16), (17, 16), (100, 32), ((1 << 17) + 1, 4096))
+            for size, chunk in cases:
                 blob = bytes((i * 7) % 251 for i in range(size))
                 p = tmpdir / f"s{size}.bin"
                 p.write_bytes(blob)
-                want_enc, want_key = encrypt_file(blob, ul_key) if blob else (b"", encrypt_file(b"", ul_key)[1])
-                cipher = megacrypt.FileCipher(str(p), size, ul_key, 1 << 20)
+                want_enc, want_key = encrypt_file(blob, ul_key)
+                cipher = megacrypt.FileCipher(str(p), size, ul_key, chunk)
                 got = bytearray()
                 while True:
                     piece = cipher.read(4096)
                     if not piece:
                         break
                     got += piece
-                assert bytes(got) == want_enc, size
-                assert list(cipher.filekey or []) == want_key, size
+                assert bytes(got) == want_enc, (size, chunk)
+                assert list(cipher.filekey or []) == want_key, (size, chunk)
         finally:
             shutil.rmtree(tmpdir, ignore_errors=True)
 
@@ -1133,6 +1165,19 @@ def selfcheck() -> None:
         assert loaded and loaded["mode"] == "tree"
         sp = skip_paths(tmp)
         assert tmp.resolve() in sp and Path(str(tmp.resolve()) + ".tmp") in sp
+        for bad in (
+            {"mode": "nope"},
+            {"mode": "split", "jobs": {"a": {"xh": "x"}}},
+            {"mode": "tree", "files": {"a.txt": {"size": "big"}}},
+        ):
+            tmp.write_text(json.dumps(bad), encoding="utf-8")
+            try:
+                load_state(tmp)
+                raise AssertionError(f"accepted bad state {bad}")
+            except ValueError:
+                pass
+        tmp.write_text(json.dumps({"mode": "split", "jobs": {"a": {"xh": "x", "root_h": "h"}}}), encoding="utf-8")
+        assert load_state(tmp)["jobs"]["a"]["root_h"] == "h"
     finally:
         shutil.rmtree(tmp.parent, ignore_errors=True)
     print("selfcheck ok")
@@ -1176,7 +1221,11 @@ def main(argv: list[str] | None = None) -> int:
     if args.jobs < 1:
         ap.error("--jobs must be >= 1")
     state_path = args.state.resolve()
-    prev = load_state(state_path)
+    try:
+        prev = load_state(state_path)
+    except ValueError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 1
     if prev and prev.get("mode") not in (None, args.mode):
         print(f"error: state mode {prev.get('mode')!r} != {args.mode!r}", file=sys.stderr)
         return 1
