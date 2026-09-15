@@ -2,7 +2,7 @@
 name = "megacrypt"
 version = "0.1.0"
 edition = "2021"
-description = "MEGA/transfer.it file encryption (AES-CTR + chunk MACs) as a native Python extension"
+description = "MEGA/transfer.it AES-CTR + chunk-MAC encrypt and decrypt as a native Python extension"
 
 [lib]
 name = "megacrypt"

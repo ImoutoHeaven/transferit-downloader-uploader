@@ -1,16 +1,15 @@
-//! MEGA / transfer.it file encryption as a native Python extension.
+//! MEGA / transfer.it AES as a native Python extension.
 //!
-//! Same wire format as the openssl fallback in `transferit_upload.py`: AES-128-CTR over the
-//! whole file (128-bit big-endian counter starting at `nonce || 0^8`) plus MEGA's chunk
-//! CBC-MAC (ramp of 128 KiB .. 1 MiB segments, each a fresh chain with IV `nonce || nonce`,
-//! condensed into the 8-word file key). One `read()` call runs without the GIL, so several
-//! upload threads actually run in parallel instead of queueing on the interpreter lock.
+//! Same wire format as the openssl fallback: AES-128-CTR over the whole file (128-bit
+//! big-endian counter starting at `nonce || 0^8`) plus MEGA's chunk CBC-MAC (ramp of
+//! 128 KiB .. 1 MiB segments, each a fresh chain with IV `nonce || nonce`, condensed into
+//! the 8-word file key). Encrypt and decrypt both release the GIL so `-j` threads run in parallel.
 
 use std::fs::File;
 use std::io::{Cursor, Read};
 
 use aes::cipher::generic_array::GenericArray;
-use aes::cipher::{BlockEncrypt, KeyInit, KeyIvInit, StreamCipher};
+use aes::cipher::{BlockDecrypt, BlockEncrypt, KeyInit, KeyIvInit, StreamCipher};
 use aes::{Aes128, Block};
 use ctr::Ctr128BE;
 use pyo3::exceptions::{PyIOError, PyValueError};
@@ -360,6 +359,135 @@ pub fn aes_cbc_inner(key: &[u8], data: &[u8], iv: &[u8]) -> Result<Vec<u8>, Stri
     Ok(out)
 }
 
+/// AES-128-ECB decrypt. `data` must already be a multiple of 16 bytes.
+pub fn aes_ecb_decrypt_inner(key: &[u8], data: &[u8]) -> Result<Vec<u8>, String> {
+    require_blocks(data)?;
+    let cipher = aes128(key)?;
+    let mut out = data.to_vec();
+    for block in out.chunks_exact_mut(16) {
+        cipher.decrypt_block(GenericArray::from_mut_slice(block));
+    }
+    Ok(out)
+}
+
+/// AES-128-CBC decrypt. `data` and `iv` must already be 16-byte aligned.
+pub fn aes_cbc_decrypt_inner(key: &[u8], data: &[u8], iv: &[u8]) -> Result<Vec<u8>, String> {
+    require_blocks(data)?;
+    if iv.len() != 16 {
+        return Err(format!("AES IV must be 16 bytes, got {}", iv.len()));
+    }
+    let cipher = aes128(key)?;
+    let mut prev = [0u8; 16];
+    prev.copy_from_slice(iv);
+    let mut out = data.to_vec();
+    for block in out.chunks_exact_mut(16) {
+        let mut saved = [0u8; 16];
+        saved.copy_from_slice(block);
+        cipher.decrypt_block(GenericArray::from_mut_slice(block));
+        for (b, p) in block.iter_mut().zip(prev.iter()) {
+            *b ^= p;
+        }
+        prev = saved;
+    }
+    Ok(out)
+}
+
+/// AES-128-CTR. Encrypt and decrypt are the same xor.
+pub fn aes_ctr_inner(key: &[u8], data: &[u8], iv: &[u8]) -> Result<Vec<u8>, String> {
+    if iv.len() != 16 {
+        return Err(format!("AES IV must be 16 bytes, got {}", iv.len()));
+    }
+    let _ = aes128(key)?;
+    let mut ctr = Ctr128BE::<Aes128>::new(GenericArray::from_slice(key), GenericArray::from_slice(iv));
+    let mut out = data.to_vec();
+    ctr.apply_keystream(&mut out);
+    Ok(out)
+}
+
+fn word_be(w: u32) -> [u8; 4] {
+    w.to_be_bytes()
+}
+
+/// MEGA file-key fold: AES key = k[0:4] xor k[4:8], CTR IV = k[4:6] || 0^8.
+pub fn aes_key_iv_from_words(k: &[u32]) -> Result<([u8; 16], [u8; 16]), String> {
+    if k.len() < 4 {
+        return Err(format!("file key must have at least 4 words, got {}", k.len()));
+    }
+    let mut key = [0u8; 16];
+    for i in 0..4 {
+        let extra = if k.len() > i + 4 { k[i + 4] } else { 0 };
+        key[i * 4..i * 4 + 4].copy_from_slice(&word_be(k[i] ^ extra));
+    }
+    let mut iv = [0u8; 16];
+    if k.len() >= 6 {
+        iv[..4].copy_from_slice(&word_be(k[4]));
+        iv[4..8].copy_from_slice(&word_be(k[5]));
+    }
+    Ok((key, iv))
+}
+
+/// Recompute the condensed MEGA chunk MAC and compare with key words 6 and 7.
+pub fn verify_mac_inner(plain: &[u8], k: &[u32]) -> bool {
+    if k.len() > 8 {
+        return true;
+    }
+    if k.len() < 8 {
+        return false;
+    }
+    let Ok((key, _)) = aes_key_iv_from_words(k) else {
+        return false;
+    };
+    let mut mac_iv = [0u8; 16];
+    mac_iv[..4].copy_from_slice(&word_be(k[4]));
+    mac_iv[4..8].copy_from_slice(&word_be(k[5]));
+    mac_iv[8..12].copy_from_slice(&word_be(k[4]));
+    mac_iv[12..16].copy_from_slice(&word_be(k[5]));
+    let pad = (16 - plain.len() % 16) % 16;
+    let mut padded = Vec::with_capacity(plain.len() + pad);
+    padded.extend_from_slice(plain);
+    padded.resize(plain.len() + pad, 0);
+    let ends = mac_segment_ends(padded.len() as u64);
+    let cipher = Aes128::new(GenericArray::from_slice(&key));
+    let mut cond = Block::default();
+    let mut start = 0usize;
+    for end in ends {
+        let end = end as usize;
+        let seg = &padded[start..end];
+        start = end;
+        let mac = if seg.is_empty() {
+            GenericArray::clone_from_slice(&mac_iv)
+        } else {
+            let mut st: Block = GenericArray::clone_from_slice(&mac_iv);
+            for block in seg.chunks_exact(16) {
+                for i in 0..16 {
+                    st[i] ^= block[i];
+                }
+                cipher.encrypt_block(&mut st);
+            }
+            st
+        };
+        for i in 0..16 {
+            cond[i] ^= mac[i];
+        }
+        cipher.encrypt_block(&mut cond);
+    }
+    let c0 = u32::from_be_bytes([cond[0], cond[1], cond[2], cond[3]]);
+    let c1 = u32::from_be_bytes([cond[4], cond[5], cond[6], cond[7]]);
+    let c2 = u32::from_be_bytes([cond[8], cond[9], cond[10], cond[11]]);
+    let c3 = u32::from_be_bytes([cond[12], cond[13], cond[14], cond[15]]);
+    c0 ^ c1 == k[6] && c2 ^ c3 == k[7]
+}
+
+/// AES-CTR decrypt of a MEGA file; optional condensed-MAC check against the 8-word file key.
+pub fn decrypt_bytes_inner(enc: &[u8], k: &[u32], verify: bool) -> Result<Vec<u8>, String> {
+    let (key, iv) = aes_key_iv_from_words(k)?;
+    let plain = aes_ctr_inner(&key, enc, &iv)?;
+    if verify && !verify_mac_inner(&plain, k) {
+        return Err("chunk MAC mismatch: downloaded bytes do not match the file key".into());
+    }
+    Ok(plain)
+}
+
 #[pyfunction]
 fn aes_ecb(key: &[u8], data: &[u8]) -> PyResult<Vec<u8>> {
     aes_ecb_inner(key, data).map_err(PyValueError::new_err)
@@ -370,6 +498,39 @@ fn aes_cbc(key: &[u8], data: &[u8], iv: &[u8]) -> PyResult<Vec<u8>> {
     aes_cbc_inner(key, data, iv).map_err(PyValueError::new_err)
 }
 
+#[pyfunction]
+fn aes_ecb_decrypt(key: &[u8], data: &[u8]) -> PyResult<Vec<u8>> {
+    aes_ecb_decrypt_inner(key, data).map_err(PyValueError::new_err)
+}
+
+#[pyfunction]
+fn aes_cbc_decrypt(key: &[u8], data: &[u8], iv: &[u8]) -> PyResult<Vec<u8>> {
+    aes_cbc_decrypt_inner(key, data, iv).map_err(PyValueError::new_err)
+}
+
+#[pyfunction]
+fn aes_ctr<'py>(py: Python<'py>, key: &[u8], data: &[u8], iv: &[u8]) -> PyResult<Bound<'py, PyBytes>> {
+    let out = py.allow_threads(|| aes_ctr_inner(key, data, iv));
+    Ok(PyBytes::new(py, &out.map_err(PyValueError::new_err)?))
+}
+
+#[pyfunction]
+fn verify_mac(py: Python<'_>, plain: &[u8], k: Vec<u32>) -> bool {
+    py.allow_threads(|| verify_mac_inner(plain, &k))
+}
+
+#[pyfunction]
+#[pyo3(signature = (data, k, verify = true))]
+fn decrypt_bytes<'py>(
+    py: Python<'py>,
+    data: &[u8],
+    k: Vec<u32>,
+    verify: bool,
+) -> PyResult<Bound<'py, PyBytes>> {
+    let out = py.allow_threads(|| decrypt_bytes_inner(data, &k, verify));
+    Ok(PyBytes::new(py, &out.map_err(PyValueError::new_err)?))
+}
+
 #[pymodule]
 fn megacrypt(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<FileCipher>()?;
@@ -377,7 +538,12 @@ fn megacrypt(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(segment_ends, m)?)?;
     m.add_function(wrap_pyfunction!(aes_ecb, m)?)?;
     m.add_function(wrap_pyfunction!(aes_cbc, m)?)?;
-    m.add("__doc__", "MEGA/transfer.it AES-CTR + chunk-MAC encryption")?;
+    m.add_function(wrap_pyfunction!(aes_ecb_decrypt, m)?)?;
+    m.add_function(wrap_pyfunction!(aes_cbc_decrypt, m)?)?;
+    m.add_function(wrap_pyfunction!(aes_ctr, m)?)?;
+    m.add_function(wrap_pyfunction!(verify_mac, m)?)?;
+    m.add_function(wrap_pyfunction!(decrypt_bytes, m)?)?;
+    m.add("__doc__", "MEGA/transfer.it AES-CTR + chunk-MAC encrypt and decrypt")?;
     Ok(())
 }
 
@@ -520,5 +686,28 @@ mod tests {
         assert_ne!(&cbc2[16..], &cbc[..]);
         assert!(aes_ecb_inner(&key, b"short").is_err());
         assert!(aes_cbc_inner(&key, pt, &[0u8; 8]).is_err());
+        let enc = aes_ecb_inner(&key, pt).unwrap();
+        assert_eq!(aes_ecb_decrypt_inner(&key, &enc).unwrap(), pt);
+        let cbc_enc = aes_cbc_inner(&key, &two, &iv).unwrap();
+        assert_eq!(aes_cbc_decrypt_inner(&key, &cbc_enc, &iv).unwrap(), two);
+        let ctr = aes_ctr_inner(&key, pt, &iv).unwrap();
+        assert_eq!(aes_ctr_inner(&key, &ctr, &iv).unwrap(), pt);
+    }
+
+    #[test]
+    fn decrypt_bytes_roundtrips_encrypt_bytes() {
+        for data in [b"".as_slice(), b"hello transfer.it e2e\n", b"0123456789abcdef!"] {
+            let (enc, filekey) = encrypt_bytes_inner(data, &UL_KEY, 1 << 20).unwrap();
+            let plain = decrypt_bytes_inner(&enc, &filekey, true).unwrap();
+            assert_eq!(plain, data);
+            assert!(verify_mac_inner(data, &filekey));
+        }
+        let (enc, filekey) = encrypt_bytes_inner(b"hello transfer.it e2e\n", &UL_KEY, 1 << 20).unwrap();
+        let mut flipped = enc.clone();
+        flipped[0] ^= 1;
+        assert!(decrypt_bytes_inner(&flipped, &filekey, true).is_err());
+        assert_eq!(decrypt_bytes_inner(&flipped, &filekey, false).unwrap().len(), enc.len());
+        assert!(verify_mac_inner(b"", &[0; 10]));
+        assert!(!verify_mac_inner(b"", &[0; 7]));
     }
 }

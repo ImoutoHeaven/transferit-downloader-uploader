@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Headless transfer.it downloader. curl_cffi + openssl."""
+"""Headless transfer.it downloader. curl_cffi + megacrypt (openssl fallback)."""
 from __future__ import annotations
 
 import argparse
@@ -21,10 +21,17 @@ import zipfile
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from queue import Empty, Queue
-from urllib.parse import urlparse
 
 from curl_cffi import requests
 from curl_cffi.requests.exceptions import RequestException
+
+try:
+    import megacrypt
+
+    if not hasattr(megacrypt, "decrypt_bytes"):
+        megacrypt = None
+except ImportError:
+    megacrypt = None
 
 BT7 = "https://bt7.api.mega.co.nz/"
 WCV = "2.246.1130"
@@ -75,18 +82,35 @@ def b64u_encode(data: bytes) -> str:
 
 
 def openssl_aes(mode: str, key: bytes, data: bytes, iv: bytes | None = None, decrypt: bool = False) -> bytes:
+    orig_len = len(data)
     if len(data) % 16:
         data = data + b"\0" * (16 - len(data) % 16)
+    if mode not in ("cbc", "ctr", "ecb"):
+        raise ValueError(mode)
+    native_iv = iv or b"\0" * 16
+    if megacrypt is not None:
+        if mode == "ctr":
+            return megacrypt.aes_ctr(key, data, native_iv)[:orig_len]
+        if mode == "ecb":
+            return megacrypt.aes_ecb_decrypt(key, data) if decrypt else megacrypt.aes_ecb(key, data)
+        return (
+            megacrypt.aes_cbc_decrypt(key, data, native_iv)
+            if decrypt
+            else megacrypt.aes_cbc(key, data, native_iv)
+        )
     args = ["openssl", "enc"]
     if decrypt:
         args.append("-d")
     args += [f"-aes-128-{mode}", "-K", key.hex(), "-nopad"]
     if mode != "ecb":
-        args += ["-iv", (iv or b"\0" * 16).hex()]
-    p = subprocess.run(args, input=data, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+        args += ["-iv", native_iv.hex()]
+    try:
+        p = subprocess.run(args, input=data, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+    except FileNotFoundError as e:
+        raise RuntimeError("openssl not found on PATH (needed for AES without megacrypt)") from e
     if p.returncode:
         raise RuntimeError(p.stderr.decode("utf-8", "replace") or "openssl failed")
-    return p.stdout
+    return p.stdout[:orig_len] if mode == "ctr" else p.stdout
 
 
 def aes_key_iv(k: list[int]) -> tuple[bytes, bytes]:
@@ -113,8 +137,10 @@ def decrypt_attr(at: str, k: list[int]) -> dict:
 def decrypt_file(enc: bytes, k: list[int]) -> bytes:
     if not enc:
         return b""
+    if megacrypt is not None:
+        return megacrypt.decrypt_bytes(enc, k, False)
     key, iv = aes_key_iv(k)
-    return openssl_aes("ctr", key, enc, iv, decrypt=True)[: len(enc)]
+    return openssl_aes("ctr", key, enc, iv, decrypt=True)
 
 
 MAC_RAMP = (0x20000, 0x60000, 0xC0000, 0x140000, 0x1E0000, 0x2A0000, 0x380000)
@@ -140,6 +166,8 @@ def verify_mac(plain: bytes, k: list[int]) -> bool:
     differently, so there is nothing to compare against and the check passes. A key with
     fewer than 8 words is malformed for a file node and fails.
     """
+    if megacrypt is not None:
+        return megacrypt.verify_mac(plain, k)
     if len(k) > 8:
         return True
     if len(k) < 8:
@@ -161,6 +189,11 @@ def verify_mac(plain: bytes, k: list[int]) -> bool:
 
 def decrypt_verified(enc: bytes, k: list[int], verify: bool = True) -> bytes:
     """Decrypt and, when the key carries a meta MAC, refuse data that fails it."""
+    if megacrypt is not None:
+        try:
+            return megacrypt.decrypt_bytes(enc, k, verify)
+        except ValueError as e:
+            raise RuntimeError(str(e)) from e
     plain = decrypt_file(enc, k)
     if verify and not verify_mac(plain, k):
         raise RuntimeError("chunk MAC mismatch: downloaded bytes do not match the file key")
@@ -445,10 +478,18 @@ def download_blob(url: str, size: int, chunk: int, jobs: int, kind: str) -> byte
             raise Retry(f"range {a}-{b}: {len(data)} bytes back")
         return data
 
+    blob = bytearray(size)
+
+    def fill(se):
+        a, b = se
+        data = one(se)
+        blob[a : b + 1] = data
+
     if len(rs) == 1:
-        return one(rs[0])[:size]
-    blob = b"".join(queue_run(rs, one, jobs))
-    return blob[:size]
+        fill(rs[0])
+    else:
+        queue_run(rs, fill, jobs)
+    return bytes(blob)
 
 
 def unlock(api: MegaAPI, xh: str, password: str) -> None:
@@ -700,6 +741,43 @@ def selfcheck() -> None:
     assert verify_mac(b"", k + [0, 0])  # per-chunk keys are skipped
     at = "Nw-u-ZTbw_9vRD2AIxhVuZVZaxzCOoaTu90_-KWvyCA"
     assert decrypt_attr(at, k)["n"] == "hello.txt"
+    key, iv = aes_key_iv(k)
+    if megacrypt is not None:
+        assert bytes(megacrypt.decrypt_bytes(enc, k, True)) == b"hello transfer.it e2e\n"
+        assert megacrypt.verify_mac(b"hello transfer.it e2e\n", k)
+        saved = megacrypt
+        real_run = subprocess.run
+        try:
+            def boom(*_a, **_k):
+                raise AssertionError("openssl used while megacrypt is loaded")
+
+            subprocess.run = boom
+            assert decrypt_verified(enc, k) == b"hello transfer.it e2e\n"
+            assert decrypt_attr(at, k)["n"] == "hello.txt"
+            assert openssl_aes("ctr", key, enc, iv, decrypt=True) == b"hello transfer.it e2e\n"
+            openssl_aes("ecb", key, b"\0" * 16)
+            openssl_aes("cbc", key, b"\0" * 16, decrypt=True)
+        finally:
+            subprocess.run = real_run
+            globals()["megacrypt"] = saved
+    else:
+        saved = megacrypt
+        real_run = subprocess.run
+        try:
+            globals()["megacrypt"] = None
+
+            def missing(*_a, **_k):
+                raise FileNotFoundError(2, "No such file")
+
+            subprocess.run = missing
+            try:
+                openssl_aes("ecb", key, b"\0" * 16)
+                raise AssertionError("missing openssl did not raise")
+            except RuntimeError as e:
+                assert "openssl not found" in str(e), e
+        finally:
+            subprocess.run = real_run
+            globals()["megacrypt"] = saved
     assert ranges(22, 8) == [(0, 7), (8, 15), (16, 21)]
     assert [split_jobs(4, n) for n in (1, 2, 4, 8)] == [4, 2, 1, 1]
     n = [0]
@@ -939,7 +1017,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("links", nargs="*", help="https://transfer.it/t/XXXXXXXXXXXX")
     ap.add_argument("-o", "--out", type=Path, default=Path("downloads"))
     ap.add_argument("-j", "--jobs", type=int, default=4)
-    ap.add_argument("--chunk-size", type=int, default=1 << 20)
+    ap.add_argument("--chunk-size", type=int, default=8 << 20)
     ap.add_argument("--zip", action="store_true", help="packed download (server zip if available)")
     ap.add_argument("--password", default=None, help="plaintext password for xv-protected links")
     ap.add_argument("--no-verify", action="store_true", help="skip the chunk MAC check on decrypted files")

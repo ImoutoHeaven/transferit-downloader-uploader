@@ -2,22 +2,20 @@
 
 Move files through [transfer.it](https://transfer.it) (MEGA) from a shell:
 `transferit_upload.py` uploads a folder and publishes links,
-`transferit_download.py` fetches links, and the Rust extension in `megacrypt/` encrypts
-uploads in native code.
+`transferit_download.py` fetches links, and the Rust extension in `megacrypt/` does MEGA
+AES in native code.
 
 ## Requirements
 
-Python 3.8 or newer. The downloader uses `openssl` on `PATH` for AES and MAC work. The
-uploader uses `openssl` only when `megacrypt` is not installed.
+Python 3.8 or newer.
 
 ```sh
 pip install tqdm        # uploader
 pip install curl_cffi   # downloader
 ```
 
-The optional `megacrypt` extension does the uploader's AES in native code and releases the
-GIL, so `-j` threads encrypt in parallel and a Windows install does not need `openssl` on
-`PATH`. Build it with a Rust toolchain:
+The optional `megacrypt` extension does AES in native code and releases the GIL, so `-j`
+threads encrypt and decrypt in parallel. Build it with a Rust toolchain:
 
 ```sh
 pip install maturin
@@ -26,7 +24,7 @@ cd megacrypt && python -m maturin build --release --out dist && pip install dist
 
 `--out dist` names the directory the install command reads; maturin writes to `target/wheels`
 by default. The wheels use the stable ABI (abi3), so one wheel per platform serves every
-CPython from 3.8 on. A Python-only install uses the openssl pipeline instead.
+CPython from 3.8 on. A Python-only install uses `openssl` on `PATH`.
 
 ## Upload
 
@@ -61,7 +59,7 @@ process immediately with that state already on disk.
 
 ```sh
 python transferit_download.py -o downloads https://transfer.it/t/XXXXXXXXXXXX
-python transferit_download.py -j 8 --chunk-size 8388608 https://transfer.it/t/A https://transfer.it/t/B
+python transferit_download.py -j 8 https://transfer.it/t/A https://transfer.it/t/B
 python transferit_download.py --zip -o downloads https://transfer.it/t/XXXXXXXXXXXX
 python transferit_download.py --password "hunter2" https://transfer.it/t/XXXXXXXXXXXX
 ```
@@ -70,8 +68,8 @@ python transferit_download.py --password "hunter2" https://transfer.it/t/XXXXXXX
 | --- | --- | --- |
 | `-o, --out` | `downloads` | Output root; each link writes under `<out>/<link id>/` |
 | `-j, --jobs` | 4 | Concurrent requests, shared across links, files and ranges |
-| `--chunk-size` | 1 MiB | Bytes per range request |
-| `--zip` | | One archive per link: the server's zip when the transfer offers one, otherwise a local one |
+| `--chunk-size` | 8 MiB | Bytes per range request |
+| `--zip` | | One archive per link: the transfer zip when offered, a locally built zip otherwise |
 | `--password` | | Plaintext password for protected links |
 | `--no-verify` | | Skip the chunk MAC check on decrypted files |
 
