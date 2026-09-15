@@ -315,11 +315,68 @@ fn segment_ends(padded_len: u64) -> Vec<u64> {
     mac_segment_ends(padded_len)
 }
 
+fn aes128(key: &[u8]) -> Result<Aes128, String> {
+    if key.len() != 16 {
+        return Err(format!("AES key must be 16 bytes, got {}", key.len()));
+    }
+    Ok(Aes128::new(GenericArray::from_slice(key)))
+}
+
+fn require_blocks(data: &[u8]) -> Result<(), String> {
+    if data.len() % 16 != 0 {
+        return Err(format!("AES data must be a multiple of 16 bytes, got {}", data.len()));
+    }
+    Ok(())
+}
+
+/// AES-128-ECB encrypt. `data` must already be a multiple of 16 bytes.
+pub fn aes_ecb_inner(key: &[u8], data: &[u8]) -> Result<Vec<u8>, String> {
+    require_blocks(data)?;
+    let cipher = aes128(key)?;
+    let mut out = data.to_vec();
+    for block in out.chunks_exact_mut(16) {
+        cipher.encrypt_block(GenericArray::from_mut_slice(block));
+    }
+    Ok(out)
+}
+
+/// AES-128-CBC encrypt. `data` and `iv` must already be 16-byte aligned.
+pub fn aes_cbc_inner(key: &[u8], data: &[u8], iv: &[u8]) -> Result<Vec<u8>, String> {
+    require_blocks(data)?;
+    if iv.len() != 16 {
+        return Err(format!("AES IV must be 16 bytes, got {}", iv.len()));
+    }
+    let cipher = aes128(key)?;
+    let mut prev = [0u8; 16];
+    prev.copy_from_slice(iv);
+    let mut out = data.to_vec();
+    for block in out.chunks_exact_mut(16) {
+        for (b, p) in block.iter_mut().zip(prev.iter()) {
+            *b ^= p;
+        }
+        cipher.encrypt_block(GenericArray::from_mut_slice(block));
+        prev.copy_from_slice(block);
+    }
+    Ok(out)
+}
+
+#[pyfunction]
+fn aes_ecb(key: &[u8], data: &[u8]) -> PyResult<Vec<u8>> {
+    aes_ecb_inner(key, data).map_err(PyValueError::new_err)
+}
+
+#[pyfunction]
+fn aes_cbc(key: &[u8], data: &[u8], iv: &[u8]) -> PyResult<Vec<u8>> {
+    aes_cbc_inner(key, data, iv).map_err(PyValueError::new_err)
+}
+
 #[pymodule]
 fn megacrypt(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<FileCipher>()?;
     m.add_function(wrap_pyfunction!(encrypt_bytes, m)?)?;
     m.add_function(wrap_pyfunction!(segment_ends, m)?)?;
+    m.add_function(wrap_pyfunction!(aes_ecb, m)?)?;
+    m.add_function(wrap_pyfunction!(aes_cbc, m)?)?;
     m.add("__doc__", "MEGA/transfer.it AES-CTR + chunk-MAC encryption")?;
     Ok(())
 }
@@ -442,5 +499,26 @@ mod tests {
         assert_eq!(&ends[..7], &MAC_RAMP);
         assert_eq!(ends[ends.len() - 2], MAC_STEADY + ((huge - 1 - MAC_STEADY) / MAC_MAX) * MAC_MAX);
         assert_eq!(*ends.last().unwrap(), huge);
+    }
+
+    #[test]
+    fn aes_ecb_and_cbc_match_known_blocks() {
+        let mut key = [0u8; 16];
+        for (i, b) in key.iter_mut().enumerate() {
+            *b = (i as u8) * 0x11;
+        }
+        let pt = b"0123456789abcdef";
+        let ecb = aes_ecb_inner(&key, pt).unwrap();
+        assert_eq!(ecb.len(), 16);
+        assert_eq!(aes_ecb_inner(&key, pt).unwrap(), ecb);
+        let iv = [0u8; 16];
+        let cbc = aes_cbc_inner(&key, pt, &iv).unwrap();
+        assert_eq!(cbc, ecb, "CBC with a zero IV equals ECB on one block");
+        let two = [pt.as_slice(), pt.as_slice()].concat();
+        let cbc2 = aes_cbc_inner(&key, &two, &iv).unwrap();
+        assert_eq!(&cbc2[..16], &cbc[..]);
+        assert_ne!(&cbc2[16..], &cbc[..]);
+        assert!(aes_ecb_inner(&key, b"short").is_err());
+        assert!(aes_cbc_inner(&key, pt, &[0u8; 8]).is_err());
     }
 }

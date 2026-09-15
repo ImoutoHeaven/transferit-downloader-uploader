@@ -134,16 +134,20 @@ def rand_a32(n: int = 4) -> list[int]:
 def openssl_aes(mode: str, key: bytes, data: bytes, iv: bytes | None = None) -> bytes:
     if len(data) % 16:
         data = data + b"\0" * (16 - len(data) % 16)
-    args = ["openssl", "enc", f"-aes-128-{mode}", "-K", key.hex(), "-nopad"]
-    if mode == "cbc":
-        args += ["-iv", (iv or b"\0" * 16).hex()]
-    elif mode == "ctr":
-        args += ["-iv", (iv or b"\0" * 16).hex()]
-    elif mode == "ecb":
-        pass
-    else:
+    if mode not in ("cbc", "ctr", "ecb"):
         raise ValueError(mode)
-    p = subprocess.run(args, input=data, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+    native_iv = iv or b"\0" * 16
+    if megacrypt is not None and mode != "ctr":
+        if mode == "ecb":
+            return megacrypt.aes_ecb(key, data)
+        return megacrypt.aes_cbc(key, data, native_iv)
+    args = ["openssl", "enc", f"-aes-128-{mode}", "-K", key.hex(), "-nopad"]
+    if mode in ("cbc", "ctr"):
+        args += ["-iv", native_iv.hex()]
+    try:
+        p = subprocess.run(args, input=data, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+    except FileNotFoundError as e:
+        raise RuntimeError("openssl not found on PATH (needed for AES without megacrypt)") from e
     if p.returncode:
         raise RuntimeError(p.stderr.decode("utf-8", "replace") or "openssl failed")
     return p.stdout
@@ -1178,6 +1182,40 @@ def selfcheck() -> None:
     k = [0x11111111, 0x22222222, 0x33333333, 0x44444444]
     enc0 = bytes_to_a32(aes_ecb_block(a32_to_bytes(k), b"\0" * 16))
     assert enc0 == [1248615789, 717595597, 4166813418, 2004225477], enc0
+    key, pt = a32_to_bytes(k), b"0123456789abcdef" * 2
+    if megacrypt is not None:
+        native_ecb = megacrypt.aes_ecb(key, pt)
+        native_cbc = megacrypt.aes_cbc(key, pt, b"\0" * 16)
+        saved = megacrypt
+        try:
+            globals()["megacrypt"] = None
+            ossl_ecb = openssl_aes("ecb", key, pt)
+            ossl_cbc = openssl_aes("cbc", key, pt, b"\0" * 16)
+        except RuntimeError:
+            ossl_ecb = ossl_cbc = None
+        finally:
+            globals()["megacrypt"] = saved
+        if ossl_ecb is not None:
+            assert native_ecb == ossl_ecb and native_cbc == ossl_cbc
+        assert openssl_aes("ecb", key, pt) == native_ecb
+        assert openssl_aes("cbc", key, pt, b"\0" * 16) == native_cbc
+    saved = megacrypt
+    real_run = subprocess.run
+    try:
+        globals()["megacrypt"] = None
+
+        def boom(*_a, **_k):
+            raise FileNotFoundError(2, "No such file")
+
+        subprocess.run = boom
+        try:
+            openssl_aes("ecb", key, b"\0" * 16)
+            raise AssertionError("missing openssl did not raise")
+        except RuntimeError as e:
+            assert "openssl not found" in str(e), e
+    finally:
+        subprocess.run = real_run
+        globals()["megacrypt"] = saved
     n = [0]
 
     def flaky():

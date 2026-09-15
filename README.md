@@ -7,16 +7,17 @@ uploads in native code.
 
 ## Requirements
 
-Python 3.8 or newer, and `openssl` on `PATH` for AES and MAC work.
+Python 3.8 or newer. The downloader uses `openssl` on `PATH` for AES and MAC work. The
+uploader uses `openssl` only when `megacrypt` is not installed.
 
 ```sh
 pip install tqdm        # uploader
 pip install curl_cffi   # downloader
 ```
 
-The optional `megacrypt` extension replaces the uploader's openssl subprocess with native
-code that releases the GIL, so `-j` threads encrypt in parallel. Build it with a Rust
-toolchain:
+The optional `megacrypt` extension does the uploader's AES in native code and releases the
+GIL, so `-j` threads encrypt in parallel and a Windows install does not need `openssl` on
+`PATH`. Build it with a Rust toolchain:
 
 ```sh
 pip install maturin
