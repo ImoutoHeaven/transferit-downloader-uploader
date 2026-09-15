@@ -10,8 +10,7 @@ AES in native code.
 Python 3.8 or newer.
 
 ```sh
-pip install tqdm        # uploader
-pip install curl_cffi   # downloader
+pip install tqdm curl_cffi
 ```
 
 The optional `megacrypt` extension does AES in native code and releases the GIL, so `-j`
@@ -59,7 +58,7 @@ process immediately with that state already on disk.
 
 ```sh
 python transferit_download.py -o downloads https://transfer.it/t/XXXXXXXXXXXX
-python transferit_download.py -j 8 https://transfer.it/t/A https://transfer.it/t/B
+python transferit_download.py -v -j 8 https://transfer.it/t/A https://transfer.it/t/B
 python transferit_download.py --zip -o downloads https://transfer.it/t/XXXXXXXXXXXX
 python transferit_download.py --password "hunter2" https://transfer.it/t/XXXXXXXXXXXX
 ```
@@ -71,6 +70,7 @@ python transferit_download.py --password "hunter2" https://transfer.it/t/XXXXXXX
 | `--chunk-size` | 8 MiB | Bytes per range request |
 | `--zip` | | One archive per link: the transfer zip when offered, a locally built zip otherwise |
 | `--password` | | Plaintext password for protected links |
+| `-v, --verbose` | | Timestamped phase log on stderr, with a stall watchdog |
 | `--no-verify` | | Skip the chunk MAC check on decrypted files |
 
 Relative paths inside a link are recreated on disk, with intermediate directories created
@@ -83,8 +83,8 @@ Names are reduced to one safe path component, `.` and `..` members are dropped, 
 write is verified to stay inside the destination. Two nodes that would land on the same
 path, or an ambiguous file/directory nest, stop the run before anything is overwritten.
 
-Payloads are written as they arrive: archive and encrypted-file contents pass through
-untouched.
+A per-link file bar writes to stderr. `-v` replaces it with a timestamped phase log and a
+stall watchdog. Ctrl+C ends the process immediately.
 
 ## Verification
 

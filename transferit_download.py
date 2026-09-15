@@ -24,6 +24,7 @@ from queue import Empty, Queue
 
 from curl_cffi import requests
 from curl_cffi.requests.exceptions import RequestException
+from tqdm import tqdm
 
 try:
     import megacrypt
@@ -32,6 +33,8 @@ try:
         megacrypt = None
 except ImportError:
     megacrypt = None
+
+tqdm.set_lock(threading.RLock())
 
 BT7 = "https://bt7.api.mega.co.nz/"
 WCV = "2.246.1130"
@@ -42,7 +45,12 @@ UA = (
 RETRY_HTTP = {408, 429, 500, 502, 503, 504}
 RETRY_MEGA = {-3, -4, -6}
 ATTEMPTS = 5
+VERBOSE = False
+_LOG_LOCK = threading.Lock()
+_PROGRESS: dict[str, tuple[float, str]] = {}
+_LOCAL = threading.local()
 _tls = threading.local()
+_CTRL_HANDLER = None
 
 
 class Retry(Exception):
@@ -200,15 +208,66 @@ def decrypt_verified(enc: bytes, k: list[int], verify: bool = True) -> bytes:
     return plain
 
 
+def log(msg: str) -> None:
+    if not VERBOSE:
+        return
+    with _LOG_LOCK:
+        print(f"[{time.strftime('%H:%M:%S')}] {msg}", file=sys.stderr, flush=True)
+
+
+def beat(key: str, detail: str) -> None:
+    if not VERBOSE:
+        return
+    _PROGRESS.pop(getattr(_LOCAL, "key", None), None)
+    _LOCAL.key = key
+    _PROGRESS[key] = (time.monotonic(), detail)
+
+
+def clear_beat(key: str | None = None) -> None:
+    key = key if key is not None else getattr(_LOCAL, "key", None)
+    if key is None:
+        return
+    _PROGRESS.pop(key, None)
+    if getattr(_LOCAL, "key", None) == key:
+        _LOCAL.key = None
+
+
+def watchdog(interval: float = 10.0, idle: float = 25.0) -> None:
+    while True:
+        time.sleep(interval)
+        now = time.monotonic()
+        for key, (ts, detail) in list(_PROGRESS.items()):
+            if now - ts >= idle:
+                log(f"WAITING {now - ts:.0f}s  {key}: {detail}")
+
+
 def install_fast_interrupt() -> None:
     """Exit immediately on Ctrl+C; a stalled range request would otherwise hold the process."""
 
-    def _die(_sig, _frame):
+    def _die(_sig=None, _frame=None):
         os._exit(130)
 
     signal.signal(signal.SIGINT, _die)
     if hasattr(signal, "SIGBREAK"):
         signal.signal(signal.SIGBREAK, _die)
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            kernel32 = ctypes.windll.kernel32
+            Handler = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.DWORD)
+
+            def _ctrl(kind):
+                if kind in (0, 1):  # CTRL_C / CTRL_BREAK
+                    os._exit(130)
+                return False
+
+            global _CTRL_HANDLER
+            _CTRL_HANDLER = Handler(_ctrl)
+            kernel32.SetConsoleCtrlHandler(_CTRL_HANDLER, True)
+        except Exception:
+            pass
 
 
 def _backoff(i: int) -> None:
@@ -351,11 +410,17 @@ def queue_run(items: list, fn, jobs: int, attempts: int = ATTEMPTS) -> list:
 
     while True:
         nwork = max(1, min(jobs, q.qsize() or 1))
-        with ThreadPoolExecutor(max_workers=nwork) as ex:
-            futs = [ex.submit(work) for _ in range(nwork)]
+        ex = ThreadPoolExecutor(max_workers=nwork)
+        futs = [ex.submit(work) for _ in range(nwork)]
+        try:
             q.join()
             for f in futs:
                 f.result()
+        except KeyboardInterrupt:
+            ex.shutdown(wait=False, cancel_futures=True)
+            os._exit(130)
+        else:
+            ex.shutdown(wait=True)
         if rq.empty():
             break
         while not rq.empty():
@@ -441,6 +506,7 @@ def http_get(url: str, headers: dict | None = None, timeout: int = 120) -> bytes
     h = {"User-Agent": UA, "Origin": "https://transfer.it", "Referer": "https://transfer.it/"}
     if headers:
         h.update(headers)
+    beat(url[:48], f"GET {url[:80]}")
     r = session().get(url, headers=h, timeout=timeout)
     if r.status_code in RETRY_HTTP:
         raise Retry(f"http {r.status_code}")
@@ -473,9 +539,11 @@ def download_blob(url: str, size: int, chunk: int, jobs: int, kind: str) -> byte
 
     def one(se):
         a, b = se
+        beat(f"range {a}-{b}", f"{kind} {a}-{b}")
         data = fetch_range(url, a, b, kind)  # retries belong to the queue, not to each range
         if len(data) != b - a + 1:
             raise Retry(f"range {a}-{b}: {len(data)} bytes back")
+        log(f"range {a}-{b}: {len(data)} bytes")
         return data
 
     blob = bytearray(size)
@@ -682,6 +750,7 @@ def download_transfer(
     written: list[Path] = []
     workers = max(1, min(jobs, len(files))) if files else 1
     per_file = split_jobs(jobs, workers)
+    log(f"xh={xh} files={len(files)} packed={packed} workers={workers} per_file={per_file}")
     if packed:
         if z:
             name = f"{xh}{safe_name(str(z))}.zip"
@@ -689,38 +758,64 @@ def download_transfer(
             if not under(dest, path):
                 raise RuntimeError(f"refusing to write outside {dest}: {name!r}")
             url, size = g_url(api, xh, z, plain=True)
-            data = download_blob(url, size, chunk, jobs, kind="http")
-            save(path, data)
+            log(f"packed zip {name} size={size}")
+            bar = tqdm(total=1, unit="file", desc=xh, leave=True, disable=VERBOSE)
+            try:
+                data = download_blob(url, size, chunk, jobs, kind="http")
+                save(path, data)
+                bar.update(1)
+            finally:
+                bar.close()
             return [path]
         unique_rels(files, dirs)
         buf = dest / f"{xh}.zip"
         staged = temp_path(dest, ".zip")
+        bar = tqdm(total=len(files), unit="file", desc=xh, leave=True, disable=VERBOSE)
         try:
             with zipfile.ZipFile(staged, "w", compression=zipfile.ZIP_STORED) as zf:
                 def one(n):
+                    t0 = time.monotonic()
+                    log(f"--> {n['rel']}")
+                    beat(n["rel"], "g url")
                     url, size = g_url(api, xh, n["h"], plain=False)
                     enc = download_blob(url, size or n.get("s") or 0, chunk, per_file, kind="mega")
-                    return n["rel"], decrypt_verified(enc, n["k"], verify)
+                    data = decrypt_verified(enc, n["k"], verify)
+                    log(f"<-- {n['rel']} {len(data)} bytes in {time.monotonic() - t0:.1f}s")
+                    bar.update(1)
+                    bar.set_postfix_str(n["rel"], refresh=False)
+                    return n["rel"], data
                 for rel, data in queue_run(files, one, workers):
                     zf.writestr(safe_rel(rel), data)
             os.replace(staged, buf)
         except BaseException:
             staged.unlink(missing_ok=True)
             raise
+        finally:
+            bar.close()
         return [buf]
 
     unique_rels(files, dirs)
+    bar = tqdm(total=len(files), unit="file", desc=xh, leave=True, disable=VERBOSE)
 
     def one(n):
+        t0 = time.monotonic()
+        log(f"--> {n['rel']}")
+        beat(n["rel"], "g url")
         url, size = g_url(api, xh, n["h"], plain=False)
         enc = download_blob(url, size or n.get("s") or 0, chunk, per_file, kind="mega")
         path = dest / safe_rel(n["rel"])
         if not under(dest, path):
             raise RuntimeError(f"refusing to write outside {dest}: {n['rel']!r}")
         save(path, decrypt_verified(enc, n["k"], verify))
+        log(f"<-- {n['rel']} {path.stat().st_size} bytes in {time.monotonic() - t0:.1f}s")
+        bar.update(1)
+        bar.set_postfix_str(n["rel"], refresh=False)
         return path
 
-    written = queue_run(files, one, workers)
+    try:
+        written = queue_run(files, one, workers)
+    finally:
+        bar.close()
     return written
 
 
@@ -999,6 +1094,8 @@ def selfcheck() -> None:
         shutil.rmtree(dest, ignore_errors=True)
     install_fast_interrupt()
     assert signal.getsignal(signal.SIGINT).__name__ == "_die"
+    if sys.platform == "win32":
+        assert _CTRL_HANDLER is not None
     print("selfcheck ok")
 
 
@@ -1021,12 +1118,19 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--zip", action="store_true", help="packed download (server zip if available)")
     ap.add_argument("--password", default=None, help="plaintext password for xv-protected links")
     ap.add_argument("--no-verify", action="store_true", help="skip the chunk MAC check on decrypted files")
+    ap.add_argument("-v", "--verbose", action="store_true", help="timestamped phase log on stderr, with a stall watchdog")
     ap.add_argument("--selfcheck", action="store_true")
     args = ap.parse_args(argv)
     if args.selfcheck:
         selfcheck()
         return 0
+    global VERBOSE
+    VERBOSE = args.verbose
     install_fast_interrupt()
+    if VERBOSE:
+        threading.Thread(target=watchdog, daemon=True).start()
+        log(f"verbose on; python={sys.version.split()[0]} platform={sys.platform}")
+        log(f"decoder={'megacrypt ' + str(megacrypt.__file__) if megacrypt else 'openssl fallback'}")
     if not args.links or args.jobs < 1 or args.chunk_size < 1:
         ap.error("need links; --jobs/--chunk-size >= 1")
     xhs = list(dict.fromkeys(parse_xh(s) for s in args.links))
@@ -1042,7 +1146,10 @@ def main(argv: list[str] | None = None) -> int:
         )
         return xh, paths
 
-    results = queue_run(xhs, one, link_workers)
+    try:
+        results = queue_run(xhs, one, link_workers)
+    except KeyboardInterrupt:
+        os._exit(130)
     for xh, paths in results:
         for p in paths:
             print(f"{xh}: {p}")
