@@ -20,6 +20,7 @@ import sys
 import tempfile
 import threading
 import time
+import traceback
 import urllib.error
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
@@ -358,12 +359,26 @@ def retryable(exc: BaseException) -> bool:
     )
 
 
+def clear_error_frames(exc: BaseException) -> None:
+    """Clear completed frames' locals while keeping exception types, chains and locations."""
+    pending = [exc]
+    seen = set()
+    while pending:
+        error = pending.pop()
+        if id(error) in seen:
+            continue
+        seen.add(id(error))
+        traceback.clear_frames(error.__traceback__)
+        pending.extend(link for link in (error.__cause__, error.__context__) if link is not None)
+
+
 def retry(fn, attempts: int = ATTEMPTS, sleep=_backoff, label: str = ""):
     last = None
     for i in range(attempts):
         try:
             return fn()
         except Exception as e:
+            clear_error_frames(e)
             last = e
             name = label or getattr(fn, "__name__", "call")
             if not retryable(e) or i + 1 == attempts:
@@ -582,7 +597,6 @@ def upload_bytes(api: MegaAPI, path: Path, name: str, parent: str) -> None:
     t_start = time.monotonic()
     ul_key = rand_a32(6)
     size = path.stat().st_size
-    box: dict = {}
     key = f"upload {name}"
     log(f"upload {name}: {size} bytes ({size / 1048576:.2f} MiB)")
     def put():
@@ -591,7 +605,6 @@ def upload_bytes(api: MegaAPI, path: Path, name: str, parent: str) -> None:
         stream = make_cipher(path, size, ul_key)
         log(f"upload {name}: segment plan ready in {time.monotonic() - t_plan:.3f}s")
         body = ProgressBody(stream, name, size, key)
-        box["stream"] = stream
         t_u = time.monotonic()
         beat(key, f"{name} requesting upload URL")
         u = api.call({"a": "u", "s": size, "ssl": 1})
@@ -620,10 +633,9 @@ def upload_bytes(api: MegaAPI, path: Path, name: str, parent: str) -> None:
         dt = time.monotonic() - t0
         rate = size / 1048576 / max(1e-6, dt)
         log(f"POST {name}: done in {dt:.1f}s ({rate:.2f} MiB/s), response {len(out)} bytes")
-        return out
+        return out, stream.filekey
 
-    completion = retry(put, label=f"POST {name}")
-    filekey = box["stream"].filekey
+    completion, filekey = retry(put, label=f"POST {name}")
     if not filekey:
         raise RuntimeError(f"incomplete upload stream for {name}")
     if len(completion) == 36 and completion.isascii() and all(c.isalnum() or c in "-_" for c in completion.decode()):
@@ -924,7 +936,11 @@ def upload_pending(
         t0 = time.monotonic()
         log(f"--> {rel}")
         beat(f"upload {path.name}", f"{rel} queued")
-        upload_bytes(api, path, path.name, parent)
+        try:
+            upload_bytes(api, path, path.name, parent)
+        except Exception as exc:
+            clear_error_frames(exc)
+            raise
         meta = file_meta(path)
         meta["done"] = True
         with lock:
@@ -1228,6 +1244,113 @@ def selfcheck() -> None:
     assert retryable(urllib.error.HTTPError("http://x", 503, "x", hdrs=None, fp=None))
     assert not retryable(urllib.error.HTTPError("http://x", 404, "x", hdrs=None, fp=None))
     assert not retryable(KeyboardInterrupt())
+
+    # Failed workers release payloads even while the first future is still blocked.
+    import weakref
+
+    class Payload:
+        pass
+
+    refs = []
+    released_before_collection = []
+    release_first = threading.Event()
+    real_upload = upload_bytes
+
+    def connection_failure():
+        payload = Payload()
+        refs.append(weakref.ref(payload))
+        raise ConnectionError("connection closed")
+
+    def rejected(_api, _path, name, _parent):
+        if name == "hold":
+            assert release_first.wait(5), "failed workers did not run"
+            return
+        if name == "reject3":
+            released_before_collection.append(all(ref() is None for ref in refs))
+            release_first.set()
+        payload = Payload()
+        refs.append(weakref.ref(payload))
+        try:
+            connection_failure()
+        except ConnectionError as exc:
+            raise urllib.error.URLError(exc) from exc
+
+    try:
+        globals()["upload_bytes"] = rejected
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            items = []
+            for name in ("hold", "reject1", "reject2", "reject3"):
+                path = root / name
+                path.write_bytes(b"test")
+                items.append((name, path, "parent"))
+            state = JobState(root / "state.json", {"files": {}})
+            with tqdm(total=4, disable=True) as bar:
+                errors = upload_pending(MegaAPI(), items, state.data["files"], state, 2, bar)
+            assert released_before_collection == [True], "failed futures retained upload payloads"
+            assert len(errors) == 3 and all(ref() is None for ref in refs)
+            assert state.data["files"]["hold"]["done"]
+            for error in errors:
+                assert isinstance(error, urllib.error.URLError) and "connection closed" in str(error)
+                assert isinstance(error.__cause__, ConnectionError)
+                assert error.__traceback__ is not None and error.__cause__.__traceback__ is not None
+    finally:
+        release_first.set()
+        globals()["upload_bytes"] = real_upload
+
+    refs.clear()
+    tries = [0]
+
+    def retry_payload():
+        assert all(ref() is None for ref in refs), "retry retained the previous payload"
+        tries[0] += 1
+        if tries[0] < 3:
+            connection_failure()
+        return "ok"
+
+    assert retry(retry_payload, sleep=lambda _i: None) == "ok" and tries[0] == 3
+    assert all(ref() is None for ref in refs)
+
+    # Exercise upload_bytes itself: an attempt's closure must not keep its encoder alive.
+    real_cipher, real_read = make_cipher, http_read
+    refs.clear()
+
+    class WatchedCipher:
+        def __init__(self, inner):
+            self.inner = inner
+
+        def read(self, n):
+            return self.inner.read(n)
+
+        @property
+        def filekey(self):
+            return self.inner.filekey
+
+    def watched_cipher(*args):
+        cipher = WatchedCipher(real_cipher(*args))
+        refs.append(weakref.ref(cipher))
+        return cipher
+
+    def rejected_response(req, _timeout):
+        while req.data.read(SOCK_CHUNK):
+            pass
+        raise urllib.error.HTTPError(req.full_url, 400, "rejected", None, None)
+
+    try:
+        globals()["make_cipher"], globals()["http_read"] = watched_cipher, rejected_response
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            source = root / "source"
+            source.write_bytes(data)
+            api = MegaAPI()
+            api.call = lambda _payload, **_kw: {"p": "https://local.invalid/upload"}
+            state = JobState(root / "state.json", {})
+            with tqdm(total=1, disable=True) as bar:
+                errors = upload_pending(api, [("source", source, "parent")], {}, state, 1, bar)
+            assert len(errors) == 1 and isinstance(errors[0], urllib.error.HTTPError)
+            assert refs and all(ref() is None for ref in refs), "failed attempt closure retained its encoder"
+    finally:
+        globals()["make_cipher"], globals()["http_read"] = real_cipher, real_read
 
     # the API layer owns one retry budget: exhaustion is not retryable again by callers
     calls = [0]
