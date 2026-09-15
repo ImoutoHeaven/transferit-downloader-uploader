@@ -4,6 +4,7 @@ __pycache__/
 megacrypt/target/
 megacrypt/Cargo.lock.orig
 .transferit-upload.json
+.transferit-download.json
 downloads/
 downloads-*/
 maxbody/

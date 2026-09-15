@@ -23,6 +23,7 @@ from pathlib import Path
 from queue import Empty, Queue
 
 from curl_cffi import requests
+from curl_cffi.curl import CURL_WRITEFUNC_ERROR
 from curl_cffi.requests.exceptions import RequestException
 from tqdm import tqdm
 
@@ -206,6 +207,38 @@ def decrypt_verified(enc: bytes, k: list[int], verify: bool = True) -> bytes:
     if verify and not verify_mac(plain, k):
         raise RuntimeError("chunk MAC mismatch: downloaded bytes do not match the file key")
     return plain
+
+
+def decrypt_inplace(path: Path, k: list[int], verify: bool = True) -> None:
+    """Decrypt a staging file one MAC segment at a time, then check its condensed MAC."""
+    if verify and len(k) < 8:
+        raise RuntimeError("chunk MAC mismatch: malformed file key")
+    check = verify and len(k) == 8
+    key, iv = aes_key_iv(k)
+    counter = int.from_bytes(iv, "big")
+    mac_iv = a32_to_bytes(k[4:6]) * 2
+    cond = [0, 0, 0, 0]
+    with path.open("r+b") as fh:
+        size = os.fstat(fh.fileno()).st_size
+        start = 0
+        for end in mac_segment_ends(size + (-size % 16)):
+            want = min(end, size) - start
+            enc = fh.read(want)
+            if len(enc) != want:
+                raise RuntimeError("staging file shorter than its declared size")
+            chunk_iv = ((counter + start // 16) % (1 << 128)).to_bytes(16, "big")
+            plain = openssl_aes("ctr", key, enc, chunk_iv, decrypt=True)
+            if check:
+                padded = plain + b"\0" * (-len(plain) % 16)
+                mac = openssl_aes("cbc", key, padded, mac_iv)[-16:] if padded else mac_iv
+                words = bytes_to_a32(mac)
+                mixed = a32_to_bytes([c ^ w for c, w in zip(cond, words)])
+                cond = bytes_to_a32(openssl_aes("ecb", key, mixed)[:16])
+            fh.seek(start)
+            fh.write(plain)
+            start += want
+    if check and (cond[0] ^ cond[1] != k[6] or cond[2] ^ cond[3] != k[7]):
+        raise RuntimeError("chunk MAC mismatch: downloaded bytes do not match the file key")
 
 
 def log(msg: str) -> None:
@@ -403,7 +436,7 @@ def queue_run(items: list, fn, jobs: int, attempts: int = ATTEMPTS) -> list:
                 if retryable(e) and n + 1 < attempts:
                     _backoff(n)
                     rq.put((idx, item, n + 1))
-                else:
+                elif not failed:
                     failed.append((item, e))
             finally:
                 q.task_done()
@@ -502,23 +535,45 @@ class MegaAPI:
         raise RuntimeError(f"API request failed after 8 attempts: {last}")  # one owned retry budget
 
 
-def http_get(url: str, headers: dict | None = None, timeout: int = 120) -> bytes:
+def fetch_range(url: str, start: int, end: int, kind: str, out) -> None:
+    """Write directly from curl's synchronous callback; bound even an oversized response."""
     h = {"User-Agent": UA, "Origin": "https://transfer.it", "Referer": "https://transfer.it/"}
-    if headers:
-        h.update(headers)
+    if kind == "mega":
+        url = f"{url}/{start}-{end}"
+    else:
+        h["Range"] = f"bytes={start}-{end}"
+    expected = end - start + 1
+    received = 0
+    failure = None
+
+    def write(data):
+        nonlocal received, failure
+        try:
+            if received + len(data) > expected:
+                raise Retry(f"range {start}-{end}: response exceeds {expected} bytes")
+            if out.write(data) != len(data):
+                raise OSError("short write to staging file")
+            received += len(data)
+            return len(data)
+        except Exception as exc:
+            failure = exc
+            return CURL_WRITEFUNC_ERROR
+
     beat(url[:48], f"GET {url[:80]}")
-    r = session().get(url, headers=h, timeout=timeout)
+    try:
+        r = session().get(url, headers=h, timeout=120, content_callback=write)
+    except RequestException:
+        if failure is not None:
+            raise failure
+        raise
+    if failure is not None:
+        raise failure
     if r.status_code in RETRY_HTTP:
         raise Retry(f"http {r.status_code}")
     if r.status_code not in (200, 206):
         raise RuntimeError(f"GET {r.status_code} {url[:80]}")
-    return r.content
-
-
-def fetch_range(url: str, start: int, end: int, kind: str) -> bytes:
-    if kind == "mega":
-        return http_get(f"{url}/{start}-{end}")
-    return http_get(url, headers={"Range": f"bytes={start}-{end}"})
+    if received != expected:
+        raise Retry(f"range {start}-{end}: {received} bytes back")
 
 
 def g_url(api: MegaAPI, xh: str, h: str, plain: bool = False) -> tuple[str, int]:
@@ -532,32 +587,37 @@ def g_url(api: MegaAPI, xh: str, h: str, plain: bool = False) -> tuple[str, int]
     return url, int(res.get("s") or 0)
 
 
-def download_blob(url: str, size: int, chunk: int, jobs: int, kind: str) -> bytes:
-    rs = ranges(size, chunk)
-    if not rs:
-        return b""
-
-    def one(se):
-        a, b = se
-        beat(f"range {a}-{b}", f"{kind} {a}-{b}")
-        data = fetch_range(url, a, b, kind)  # retries belong to the queue, not to each range
-        if len(data) != b - a + 1:
-            raise Retry(f"range {a}-{b}: {len(data)} bytes back")
-        log(f"range {a}-{b}: {len(data)} bytes")
-        return data
-
-    blob = bytearray(size)
+def download_file(
+    url: str, size: int, chunk: int, jobs: int, kind: str, path: Path,
+    k: list[int] | None = None, verify: bool = True,
+) -> None:
+    """Stage ranges on disk, decrypt and verify in bounded buffers, then publish atomically."""
+    if size < 0 or chunk < 1 or jobs < 1:
+        raise ValueError("need size >= 0 and chunk/jobs >= 1")
+    tmp = temp_path(path.parent, ".part")
 
     def fill(se):
         a, b = se
-        data = one(se)
-        blob[a : b + 1] = data
+        beat(f"range {a}-{b}", f"{kind} {a}-{b}")
+        with tmp.open("r+b", buffering=1 << 20) as out:
+            out.seek(a)
+            fetch_range(url, a, b, kind, out)  # retries overwrite only this range
+        log(f"range {a}-{b}: {b - a + 1} bytes")
 
-    if len(rs) == 1:
-        fill(rs[0])
-    else:
-        queue_run(rs, fill, jobs)
-    return bytes(blob)
+    try:
+        with tmp.open("wb") as out:
+            out.truncate(size)
+        rs = ranges(size, chunk)
+        if len(rs) == 1:
+            retry(lambda: fill(rs[0]))
+        elif rs:
+            queue_run(rs, fill, jobs)
+        if k is not None:
+            decrypt_inplace(tmp, k, verify)
+        os.replace(tmp, path)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
 
 
 def unlock(api: MegaAPI, xh: str, password: str) -> None:
@@ -712,6 +772,87 @@ def save(path: Path, data: bytes) -> None:
         raise
 
 
+def atomic_write(path: Path, data: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = temp_path(path.parent, ".json.tmp")
+    try:
+        tmp.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+        os.replace(tmp, path)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
+
+
+class JobState:
+    def __init__(self, path: Path, data: dict):
+        self.path = path.resolve()
+        self.data = data
+        self._lock = threading.RLock()
+
+    def lock(self) -> threading.RLock:
+        return self._lock
+
+    def save(self) -> None:
+        with self._lock:
+            atomic_write(self.path, self.data)
+
+
+def _is_int(value) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _check_files(path: Path, records) -> None:
+    if records is None:
+        return
+    if not isinstance(records, dict):
+        raise ValueError(f"{path}: file records must be an object")
+    for rel, meta in records.items():
+        if not isinstance(rel, str) or not isinstance(meta, dict) or not _is_int(meta.get("size")):
+            raise ValueError(f"{path}: bad file record for {rel!r}")
+        if "done" in meta and not isinstance(meta["done"], bool):
+            raise ValueError(f"{path}: bad done flag for {rel!r}")
+        if "h" in meta and not isinstance(meta["h"], str):
+            raise ValueError(f"{path}: bad handle for {rel!r}")
+        if "verify" in meta and not isinstance(meta["verify"], bool):
+            raise ValueError(f"{path}: bad verify flag for {rel!r}")
+
+
+def load_state(path: Path) -> dict | None:
+    if not path.is_file():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as e:
+        raise ValueError(f"{path}: state must be a JSON object") from e
+    if not isinstance(data, dict):
+        raise ValueError(f"{path}: state must be a JSON object")
+    if "packed" in data and not isinstance(data["packed"], bool):
+        raise ValueError(f"{path}: bad packed flag")
+    if "out" in data and not isinstance(data["out"], str):
+        raise ValueError(f"{path}: bad out")
+    if "jobs" in data and not isinstance(data["jobs"], dict):
+        raise ValueError(f"{path}: jobs must be an object")
+    for xh, job in (data.get("jobs") or {}).items():
+        if not isinstance(xh, str) or len(xh) != 12 or not set(xh) <= XH_ALPHABET:
+            raise ValueError(f"{path}: bad job key {xh!r}")
+        if not isinstance(job, dict):
+            raise ValueError(f"{path}: bad job record for {xh!r}")
+        if "packed" in job and not isinstance(job["packed"], bool):
+            raise ValueError(f"{path}: bad packed flag for job {xh!r}")
+        if "closed" in job and not isinstance(job["closed"], bool):
+            raise ValueError(f"{path}: bad closed flag for job {xh!r}")
+        if "files" in job and not isinstance(job["files"], dict):
+            raise ValueError(f"{path}: file records must be an object")
+        _check_files(path, job.get("files"))
+    return data
+
+
+def file_done(meta: dict, path: Path, size: int, verify: bool = False) -> bool:
+    if not (bool(meta.get("done")) and path.is_file() and path.stat().st_size == size == meta.get("size")):
+        return False
+    return (not verify) or bool(meta.get("verify"))
+
+
 def unique_rels(files: list[dict], dirs: dict[str, set[str]] | None = None) -> None:
     """Refuse transfers whose sanitized paths would collide or nest ambiguously."""
     seen: dict[str, str] = {}
@@ -743,11 +884,22 @@ def download_transfer(
     packed: bool,
     password: str | None = None,
     verify: bool = True,
+    state: JobState | None = None,
 ) -> list[Path]:
     info, files, dirs = load_nodes(api, xh, password)
     dest.mkdir(parents=True, exist_ok=True)
     z = info.get("z") if isinstance(info, dict) else None
-    written: list[Path] = []
+    job: dict | None = None
+    files_meta: dict = {}
+    if state is not None:
+        with state.lock():
+            jobs_d = state.data.setdefault("jobs", {})
+            job = jobs_d.setdefault(xh, {"packed": packed, "files": {}})
+            if job.get("packed") not in (None, packed):
+                raise RuntimeError(f"state packed {job.get('packed')!r} != {packed!r} for {xh}")
+            job["packed"] = packed
+            files_meta = job.setdefault("files", {})
+            state.save()
     workers = max(1, min(jobs, len(files))) if files else 1
     per_file = split_jobs(jobs, workers)
     log(f"xh={xh} files={len(files)} packed={packed} workers={workers} per_file={per_file}")
@@ -757,36 +909,72 @@ def download_transfer(
             path = dest / name
             if not under(dest, path):
                 raise RuntimeError(f"refusing to write outside {dest}: {name!r}")
+            if state is not None and path.resolve() == state.path:
+                raise RuntimeError(f"refusing to overwrite the resume file: {name}")
+            rel = name
             url, size = g_url(api, xh, z, plain=True)
+            meta = files_meta.get(rel) or {}
+            if job is not None and file_done(meta, path, size, verify):
+                log(f"{xh}: packed zip already done")
+                if not job.get("closed"):
+                    with state.lock():
+                        job["closed"] = True
+                        state.save()
+                return [path]
             log(f"packed zip {name} size={size}")
             bar = tqdm(total=1, unit="file", desc=xh, leave=True, disable=VERBOSE)
             try:
-                data = download_blob(url, size, chunk, jobs, kind="http")
-                save(path, data)
+                download_file(url, size, chunk, jobs, "http", path)
+                if job is not None:
+                    with state.lock():
+                        files_meta[rel] = {"size": size, "done": True, "h": str(z), "verify": True}
+                        job["closed"] = True
+                        state.save()
                 bar.update(1)
             finally:
                 bar.close()
             return [path]
         unique_rels(files, dirs)
         buf = dest / f"{xh}.zip"
+        if state is not None and buf.resolve() == state.path:
+            raise RuntimeError(f"refusing to overwrite the resume file: {buf.name}")
+        rel = buf.name
+        meta = files_meta.get(rel) or {}
+        if job is not None and file_done(meta, buf, int(meta.get("size") or 0), verify):
+            log(f"{xh}: local zip already done")
+            if not job.get("closed"):
+                with state.lock():
+                    job["closed"] = True
+                    state.save()
+            return [buf]
         staged = temp_path(dest, ".zip")
         bar = tqdm(total=len(files), unit="file", desc=xh, leave=True, disable=VERBOSE)
         try:
             with zipfile.ZipFile(staged, "w", compression=zipfile.ZIP_STORED) as zf:
+                zip_lock = threading.Lock()
+
                 def one(n):
                     t0 = time.monotonic()
                     log(f"--> {n['rel']}")
                     beat(n["rel"], "g url")
                     url, size = g_url(api, xh, n["h"], plain=False)
-                    enc = download_blob(url, size or n.get("s") or 0, chunk, per_file, kind="mega")
-                    data = decrypt_verified(enc, n["k"], verify)
-                    log(f"<-- {n['rel']} {len(data)} bytes in {time.monotonic() - t0:.1f}s")
+                    member = temp_path(dest, ".member")
+                    try:
+                        download_file(url, size or n.get("s") or 0, chunk, per_file, "mega", member, n["k"], verify)
+                        with zip_lock:
+                            zf.write(member, safe_rel(n["rel"]))
+                    finally:
+                        member.unlink(missing_ok=True)
+                    log(f"<-- {n['rel']} in {time.monotonic() - t0:.1f}s")
                     bar.update(1)
                     bar.set_postfix_str(n["rel"], refresh=False)
-                    return n["rel"], data
-                for rel, data in queue_run(files, one, workers):
-                    zf.writestr(safe_rel(rel), data)
+                queue_run(files, one, workers)
             os.replace(staged, buf)
+            if job is not None:
+                with state.lock():
+                    files_meta[rel] = {"size": buf.stat().st_size, "done": True, "verify": verify}
+                    job["closed"] = True
+                    state.save()
         except BaseException:
             staged.unlink(missing_ok=True)
             raise
@@ -795,28 +983,55 @@ def download_transfer(
         return [buf]
 
     unique_rels(files, dirs)
-    bar = tqdm(total=len(files), unit="file", desc=xh, leave=True, disable=VERBOSE)
+    pending = []
+    kept: list[Path] = []
+    for n in files:
+        rel = safe_rel(n["rel"])
+        path = dest / rel
+        size = int(n.get("s") or 0)
+        if job is not None and file_done(files_meta.get(rel) or {}, path, size, verify):
+            kept.append(path)
+            continue
+        pending.append(n)
+    workers = max(1, min(jobs, len(pending))) if pending else 1
+    per_file = split_jobs(jobs, workers)
+    log(f"{xh}: {len(kept)} done, {len(pending)} to fetch, workers={workers} per_file={per_file}")
+    bar = tqdm(total=len(pending), unit="file", desc=xh, leave=True, disable=VERBOSE)
 
     def one(n):
         t0 = time.monotonic()
-        log(f"--> {n['rel']}")
-        beat(n["rel"], "g url")
+        rel = safe_rel(n["rel"])
+        log(f"--> {rel}")
+        beat(rel, "g url")
         url, size = g_url(api, xh, n["h"], plain=False)
-        enc = download_blob(url, size or n.get("s") or 0, chunk, per_file, kind="mega")
-        path = dest / safe_rel(n["rel"])
+        path = dest / rel
         if not under(dest, path):
             raise RuntimeError(f"refusing to write outside {dest}: {n['rel']!r}")
-        save(path, decrypt_verified(enc, n["k"], verify))
-        log(f"<-- {n['rel']} {path.stat().st_size} bytes in {time.monotonic() - t0:.1f}s")
+        if state is not None and path.resolve() == state.path:
+            raise RuntimeError(f"refusing to overwrite the resume file: {rel}")
+        download_file(url, size or n.get("s") or 0, chunk, per_file, "mega", path, n["k"], verify)
+        if job is not None:
+            with state.lock():
+                files_meta[rel] = {"size": path.stat().st_size, "done": True, "h": n["h"], "verify": verify}
+                state.save()
+        log(f"<-- {rel} {path.stat().st_size} bytes in {time.monotonic() - t0:.1f}s")
         bar.update(1)
-        bar.set_postfix_str(n["rel"], refresh=False)
+        bar.set_postfix_str(rel, refresh=False)
         return path
 
     try:
-        written = queue_run(files, one, workers)
+        written = queue_run(pending, one, max(1, min(jobs, len(pending))) if pending else 1) if pending else []
     finally:
         bar.close()
-    return written
+    if job is not None and not pending:
+        with state.lock():
+            job["closed"] = True
+            state.save()
+    elif job is not None and len(kept) + len(written) == len(files):
+        with state.lock():
+            job["closed"] = True
+            state.save()
+    return kept + written
 
 
 def selfcheck() -> None:
@@ -875,6 +1090,63 @@ def selfcheck() -> None:
             globals()["megacrypt"] = saved
     assert ranges(22, 8) == [(0, 7), (8, 15), (16, 21)]
     assert [split_jobs(4, n) for n in (1, 2, 4, 8)] == [4, 2, 1, 1]
+
+    # Range retries must overwrite their own offsets; only verified staging files publish.
+    real_session, real_backoff = session, _backoff
+    payload = [enc]
+    calls = {}
+
+    class RangeSession:
+        def get(self, url, *, headers, timeout, content_callback):
+            spec = headers["Range"].split("=", 1)[1] if "Range" in headers else url.rsplit("/", 1)[-1]
+            a, b = map(int, spec.split("-"))
+            calls[a] = calls.get(a, 0) + 1
+            data = payload[0][a:b + 1]
+            if a == 0 and calls[a] == 1:
+                data = data[:-1]
+            for i in range(0, len(data), 3):
+                if content_callback(data[i:i + 3]) == CURL_WRITEFUNC_ERROR:
+                    raise RequestException("write callback aborted")
+            return type("Response", (), {"status_code": 206})()
+
+    try:
+        globals()["session"] = lambda: RangeSession()
+        globals()["_backoff"] = lambda _i: None
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "file"
+            download_file("test", len(enc), 7, 3, "mega", target, k)
+            assert target.read_bytes() == b"hello transfer.it e2e\n" and calls[0] == 2
+            calls.clear()
+            download_file("test", len(enc), len(enc), 1, "http", target, k)
+            assert target.read_bytes() == b"hello transfer.it e2e\n" and calls[0] == 2
+            payload[0] = flipped
+            try:
+                download_file("test", len(enc), 7, 3, "mega", target, k)
+                raise AssertionError("corrupt staging file published")
+            except RuntimeError as exc:
+                assert "MAC mismatch" in str(exc)
+            assert target.read_bytes() == b"hello transfer.it e2e\n"
+            assert not list(Path(tmp).glob(".dl-*"))
+            download_file("test", len(enc), 7, 3, "mega", target, k, verify=False)
+            assert target.read_bytes() == decrypt_file(flipped, k)
+            download_file("test", 0, 7, 3, "mega", target, k, verify=False)
+            assert target.read_bytes() == b""
+
+            class Oversize:
+                def get(self, _url, *, content_callback, **_kw):
+                    assert content_callback(b"1234") == 4
+                    assert content_callback(b"5") == CURL_WRITEFUNC_ERROR
+                    raise RequestException("write callback aborted")
+
+            globals()["session"] = lambda: Oversize()
+            with target.open("w+b") as out:
+                try:
+                    fetch_range("test", 0, 3, "http", out)
+                    raise AssertionError("oversized range accepted")
+                except Retry as exc:
+                    assert "exceeds" in str(exc) and out.tell() == 4
+    finally:
+        globals()["session"], globals()["_backoff"] = real_session, real_backoff
     n = [0]
 
     def flaky():
@@ -1096,6 +1368,48 @@ def selfcheck() -> None:
     assert signal.getsignal(signal.SIGINT).__name__ == "_die"
     if sys.platform == "win32":
         assert _CTRL_HANDLER is not None
+
+    tmp = Path(tempfile.mkdtemp())
+    try:
+        st = tmp / "state.json"
+        assert load_state(st) is None
+        data = {"out": str(tmp), "packed": False, "jobs": {}}
+        JobState(st, data).save()
+        loaded = load_state(st)
+        assert loaded["packed"] is False and loaded["jobs"] == {}
+        xh = "a" * 12
+        dest = tmp / xh
+        dest.mkdir()
+        target = dest / "a.txt"
+        save(target, b"hello")
+        assert not file_done({"size": 5, "done": False}, target, 5)
+        assert file_done({"size": 5, "done": True}, target, 5)
+        assert file_done({"size": 5, "done": True}, target, 5, verify=False)
+        assert not file_done({"size": 5, "done": True}, target, 5, verify=True)
+        assert file_done({"size": 5, "done": True, "verify": True}, target, 5, verify=True)
+        assert not file_done({"size": 4, "done": True}, target, 5)
+        target.unlink()
+        assert not file_done({"size": 5, "done": True}, target, 5)
+        bad = tmp / "bad.json"
+        bad.write_text('{"jobs": {"short": {}}}\n', encoding="utf-8")
+        try:
+            load_state(bad)
+            raise AssertionError("short job key accepted")
+        except ValueError:
+            pass
+        for blob in ('{"jobs": null}\n', '{"jobs": {"aaaaaaaaaaaa": {"files": null}}}\n', '{"out": null}\n', '{"packed": null}\n', '{not json'):
+            bad.write_text(blob, encoding="utf-8")
+            try:
+                load_state(bad)
+                raise AssertionError(f"accepted {blob!r}")
+            except ValueError:
+                pass
+        data["jobs"][xh] = {"packed": True, "files": {}}
+        JobState(st, data).save()
+        loaded = load_state(st)
+        assert loaded["jobs"][xh]["packed"] is True
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
     print("selfcheck ok")
 
 
@@ -1119,6 +1433,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--password", default=None, help="plaintext password for xv-protected links")
     ap.add_argument("--no-verify", action="store_true", help="skip the chunk MAC check on decrypted files")
     ap.add_argument("-v", "--verbose", action="store_true", help="timestamped phase log on stderr, with a stall watchdog")
+    ap.add_argument("--state", type=Path, default=Path(".transferit-download.json"), help="resume json")
     ap.add_argument("--selfcheck", action="store_true")
     args = ap.parse_args(argv)
     if args.selfcheck:
@@ -1136,13 +1451,30 @@ def main(argv: list[str] | None = None) -> int:
     xhs = list(dict.fromkeys(parse_xh(s) for s in args.links))
     api = MegaAPI()
     args.out.mkdir(parents=True, exist_ok=True)
+    state_path = args.state.resolve()
+    try:
+        prev = load_state(state_path)
+    except ValueError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 1
+    if prev and prev.get("packed") not in (None, args.zip):
+        print(f"error: state packed {prev.get('packed')!r} != {args.zip!r}", file=sys.stderr)
+        return 1
+    if prev and "out" in prev and Path(prev["out"]) != args.out.resolve():
+        print(f"error: state out {prev['out']!r} != {str(args.out.resolve())!r}", file=sys.stderr)
+        return 1
+    data = prev or {"packed": args.zip, "out": str(args.out.resolve()), "jobs": {}}
+    data["packed"] = args.zip
+    data["out"] = str(args.out.resolve())
+    state = JobState(state_path, data)
+    state.save()
     link_workers = max(1, min(args.jobs, len(xhs)))
     per_link = split_jobs(args.jobs, link_workers)
 
     def one(xh: str):
         dest = args.out / xh
         paths = download_transfer(
-            api, xh, dest, per_link, args.chunk_size, args.zip, args.password, not args.no_verify
+            api, xh, dest, per_link, args.chunk_size, args.zip, args.password, not args.no_verify, state
         )
         return xh, paths
 

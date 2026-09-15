@@ -13,8 +13,9 @@ Python 3.8 or newer.
 pip install tqdm curl_cffi
 ```
 
-The optional `megacrypt` extension does AES in native code and releases the GIL, so `-j`
-threads encrypt and decrypt in parallel. Build it with a Rust toolchain:
+The optional `megacrypt` extension does AES in native code. Its streaming encryptor and
+AES-CTR primitive release the GIL; the CBC primitive holds it for each call. Build it with
+a Rust toolchain:
 
 ```sh
 pip install maturin
@@ -58,7 +59,7 @@ process immediately with that state already on disk.
 
 ```sh
 python transferit_download.py -o downloads https://transfer.it/t/XXXXXXXXXXXX
-python transferit_download.py -v -j 8 https://transfer.it/t/A https://transfer.it/t/B
+python transferit_download.py -v --state job.json -j 8 https://transfer.it/t/A https://transfer.it/t/B
 python transferit_download.py --zip -o downloads https://transfer.it/t/XXXXXXXXXXXX
 python transferit_download.py --password "hunter2" https://transfer.it/t/XXXXXXXXXXXX
 ```
@@ -70,6 +71,7 @@ python transferit_download.py --password "hunter2" https://transfer.it/t/XXXXXXX
 | `--chunk-size` | 8 MiB | Bytes per range request |
 | `--zip` | | One archive per link: the transfer zip when offered, a locally built zip otherwise |
 | `--password` | | Plaintext password for protected links |
+| `--state` | `.transferit-download.json` | Resume file, written atomically |
 | `-v, --verbose` | | Timestamped phase log on stderr, with a stall watchdog |
 | `--no-verify` | | Skip the chunk MAC check on decrypted files |
 
@@ -79,12 +81,19 @@ checked against the condensed chunk MAC in its file key. Keys in the per-chunk M
 carry a different layout, so those files are written unverified; `--no-verify` does the same
 for every file.
 
+Downloads stage ranges directly on disk, then decrypt and verify in segments of at most
+1 MiB. Memory covers small buffers per worker and range-scheduling metadata. Completed
+files replace their destinations atomically after verification. Local ZIP creation adds
+each completed member from disk; temporary disk space holds the archive and active members.
+
 Names are reduced to one safe path component, `.` and `..` members are dropped, and every
 write is verified to stay inside the destination. Two nodes that would land on the same
 path, or an ambiguous file/directory nest, stop the run before anything is overwritten.
 
 A per-link file bar writes to stderr. `-v` replaces it with a timestamped phase log and a
-stall watchdog. Ctrl+C ends the process immediately.
+stall watchdog. Ctrl+C ends the process immediately, with completed files already recorded
+in the state file. Re-running the same command skips those files when the destination size
+still matches.
 
 ## Verification
 
