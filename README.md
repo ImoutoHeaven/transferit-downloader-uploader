@@ -29,31 +29,64 @@ CPython from 3.8 on. A Python-only install uses `openssl` on `PATH`.
 ## Upload
 
 ```sh
-python transferit_upload.py -j 4 /data/2026-08                    # one link for the folder
-python transferit_upload.py --mode split -j 4 /data/2026-08       # one link per folder
-python transferit_upload.py -v --state job.json /data/2026-08     # phase log and resume file
+python transferit_upload.py -j 4 /data/2026-08                                           # one link for the folder
+python transferit_upload.py --mode split --state split.json -j 4 /data/2026-08           # one link per folder
+python transferit_upload.py --mode files -o links --state files.json -j 4 /data/2026-08  # one link file per file
+python transferit_upload.py -v --state job.json /data/2026-08                            # phase log and resume file
 ```
 
 | Flag | Default | Meaning |
 | --- | --- | --- |
-| `--mode` | `tree` | `tree`: one link, relative paths preserved. `split`: one link per folder holding direct files |
-| `-j, --jobs` | 4 | Concurrent uploads, shared across folders |
+| `--mode` | `tree` | `tree`: one link, relative paths preserved. `split`: one link per folder holding direct files. `files`: one link per regular file under a directory, recursive |
+| `-o, --out` | | Link output directory for `--mode files` (rejected in other modes) |
+| `-j, --jobs` | 4 | Concurrent uploads, shared across folders and files |
 | `--state` | `.transferit-upload.json` | Resume file, written atomically and kept out of the transfer |
 | `-v, --verbose` | | Timestamped phase log on stderr, with a stall watchdog |
 | `--chunk-mib` | 8 | Encrypt and read chunk per file; socket writes stay at 32 MiB |
 
-Tree mode takes one path and prints one link. Split mode takes any number of paths and
-prints `folder: link` for each folder that published. A link appears once every file is
-registered and the transfer is closed.
+Tree mode takes one path and prints one link. Split mode takes one or more paths and creates
+one transfer per folder holding direct files (plus any file path given directly). Files mode
+takes one input directory and `-o, --out`, walks it recursively without following directory
+symlinks, and creates an independent transfer and link for every regular file, including
+zero-byte files, while omitting empty directories; an input directory with no uploadable
+regular files (excluding `<state>` and `<state>.tmp`) fails with `error: no files`. Both
+`split` and `files` print `<path>: <link>` for each published transfer followed by `---` and
+the bare URLs on stdout.
+
+In `files` mode, each file writes `<out>/<rel>-link.txt`, appending `-link.txt` to the full
+filename (`sub/photo.jpg` -> `links/sub/photo.jpg-link.txt`), as UTF-8 `<link>\n` via an
+atomic rename as soon as that file's transfer closes. Resolved input and output directories
+must not overlap in either direction. Symbolic file aliases in the source tree, symlinked or
+non-directory parents under the resolved `--out` root, colliding `-link.txt` paths, and paths
+that overlap `--state` or `<state>.tmp` are rejected before upload. Existing files under
+`--out` are never overwritten; a destination file may remain only when it already contains
+that file's saved `<link>\n`.
 
 Files stream, so peak memory per in-flight file is bounded by a few chunks of `--chunk-mib`
 plus one 32 MiB write buffer, and socket inactivity is tolerated for `max(120, size / 256 KiB)`
 seconds.
 
-Uploads fail closed: a file that keeps failing leaves the transfer unclosed and its link
-unpublished, while split mode still publishes the folders that completed. Re-running the
-same command resumes from the state file and skips completed files, and Ctrl+C ends the
-process immediately with that state already on disk.
+Uploads fail closed: a link is emitted only after every file in its transfer is registered
+with unchanged size and modification time and closing succeeds. In `split` and `files`
+modes, each failed target reports an error while the remaining targets finish; any failure
+makes the process exit non-zero. If writing `-link.txt` fails after closing, the published
+link remains in `--state` for reconstruction on resume. `--state` is bound to `--mode` and,
+in `tree` and `files` modes, the resolved input root (`<state>` and `<state>.tmp` are skipped
+when inside the input tree); use the same `--state` to resume a job and a separate `--state`
+for another mode or root.
+
+Re-running the same command resumes from `--state`, and Ctrl+C ends the process immediately
+with saved state on disk. In `files` mode, each file saves its confirmed upload metadata to
+`--state`, closes its transfer, saves the published link to `--state`, and then writes
+`<rel>-link.txt`. On resume, closed transfers skip upload and reconstruct any missing
+`-link.txt` files directly from `--state` (including into a new disjoint `--out` directory),
+confirmed uploads whose close did not finish retry closing only, and unconfirmed uploads
+(including files interrupted or modified mid-upload) start a fresh transfer on resume to
+avoid duplicate registered nodes. In-flight files restart rather than resume from a byte
+offset. Confirmed uploads are checked by `size`, `mtime`, and `mtime_ns`, not a content
+hash; if a source file changes after its upload is confirmed, `files` mode fails rather than
+reusing or overwriting its link, and uploading the modified file requires a new `--state` and
+`--out`.
 
 ## Download
 
@@ -98,7 +131,7 @@ still matches.
 ## Verification
 
 ```sh
-python transferit_upload.py --selfcheck     # cipher vectors, MAC boundaries, native vs openssl, retries, state
+python transferit_upload.py --selfcheck     # cipher vectors, MAC boundaries, native vs openssl, retries, state, per-file resume and link safety
 python transferit_download.py --selfcheck   # decryption and MAC vectors, ranges, tree validation, hostile names
 cd megacrypt && cargo test --release        # cipher vectors, segment ramp, tail padding, key publication
 ```

@@ -695,7 +695,11 @@ def iter_files(root: Path, skip: set[Path]) -> list[Path]:
     if not root.is_dir():
         raise FileNotFoundError(root)
     out: list[Path] = []
-    for dirpath, _dns, filenames in os.walk(root):
+
+    def walk_error(error):
+        raise error
+
+    for dirpath, _dns, filenames in os.walk(root, onerror=walk_error):
         for fn in filenames:
             p = Path(dirpath) / fn
             if p.resolve() in skip or not p.is_file():
@@ -821,6 +825,8 @@ def _check_files(path: Path, records) -> None:
             raise ValueError(f"{path}: bad file record for {rel!r}")
         if "done" in meta and not isinstance(meta["done"], bool):
             raise ValueError(f"{path}: bad done flag for {rel!r}")
+        if "mtime_ns" in meta and not _is_int(meta["mtime_ns"]):
+            raise ValueError(f"{path}: bad mtime_ns for {rel!r}")
 
 
 def load_state(path: Path) -> dict | None:
@@ -829,7 +835,7 @@ def load_state(path: Path) -> dict | None:
     data = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(data, dict):
         raise ValueError(f"{path}: state must be a JSON object")
-    if data.get("mode") not in (None, "tree", "split"):
+    if data.get("mode") not in (None, "tree", "split", "files"):
         raise ValueError(f"{path}: unknown mode {data.get('mode')!r}")
     for key in ("closed", "root", "xh", "root_h"):
         if key in data and not isinstance(data[key], bool if key == "closed" else str):
@@ -881,12 +887,16 @@ def bind_api(state: dict) -> MegaAPI:
 
 def file_meta(p: Path) -> dict:
     st = p.stat()
-    return {"size": st.st_size, "mtime": int(st.st_mtime), "done": False}
+    return {"size": st.st_size, "mtime": int(st.st_mtime), "mtime_ns": st.st_mtime_ns, "done": False}
 
 
 def stale(meta: dict, p: Path) -> bool:
     st = p.stat()
-    return (not meta.get("done")) or meta.get("size") != st.st_size or meta.get("mtime") != int(st.st_mtime)
+    return (
+        not meta.get("done") or meta.get("size") != st.st_size
+        or meta.get("mtime") != int(st.st_mtime)
+        or ("mtime_ns" in meta and meta["mtime_ns"] != st.st_mtime_ns)
+    )
 
 
 def publish(api: MegaAPI, xh: str, ok: bool) -> str | None:
@@ -937,11 +947,13 @@ def upload_pending(
         log(f"--> {rel}")
         beat(f"upload {path.name}", f"{rel} queued")
         try:
+            meta = file_meta(path)
             upload_bytes(api, path, path.name, parent)
+            if file_meta(path) != meta:
+                raise RuntimeError(f"source changed during upload: {path}")
         except Exception as exc:
             clear_error_frames(exc)
             raise
-        meta = file_meta(path)
         meta["done"] = True
         with lock:
             files_meta[rel] = meta
@@ -1014,9 +1026,73 @@ def run_tree(root: Path, state: JobState, jobs: int) -> str:
 
 
 def run_split(paths: list[Path], state: JobState, jobs: int) -> tuple[list[tuple[Path, str]], list[tuple[Path, BaseException]]]:
+    return run_targets(collect_split(paths, skip_paths(state.path)), state, jobs)
+
+
+def check_link_output(path: Path, out: Path, link: str | None) -> None:
+    if out not in path.parents or path.resolve() != path:
+        raise ValueError(f"unsafe link output path: {path}")
+    for parent in path.parents:
+        if parent.exists() and not parent.is_dir():
+            raise ValueError(f"link output parent is not a directory: {parent}")
+        if parent == out:
+            break
+    if path.exists() and (
+        not path.is_file() or link is None or path.read_text(encoding="utf-8") != link + "\n"
+    ):
+        raise ValueError(f"refusing to overwrite existing link output: {path}")
+
+
+def write_link(path: Path, out: Path, link: str) -> None:
+    check_link_output(path, out, link)
+    if path.exists():
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = None
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", newline="\n",
+                                         dir=path.parent, prefix=".link-", delete=False) as f:
+            tmp = Path(f.name)
+            f.write(link + "\n")
+        os.replace(tmp, path)
+    finally:
+        if tmp is not None:
+            tmp.unlink(missing_ok=True)
+
+
+def run_files(root: Path, out: Path, state: JobState, jobs: int) -> tuple[list[tuple[Path, str]], list[tuple[Path, BaseException]]]:
+    root, out = root.resolve(), out.resolve()
+    if not root.is_dir():
+        raise ValueError(f"files mode needs a directory: {root}")
+    if root == out or root in out.parents or out in root.parents:
+        raise ValueError("input and output directories must not overlap")
+    if out.exists() and not out.is_dir():
+        raise ValueError(f"output is not a directory: {out}")
+    files = iter_files(root, skip_paths(state.path))
+    outputs = {}
+    reserved = skip_paths(state.path)
+    for p in files:
+        if p.resolve() != p:
+            raise ValueError(f"files mode does not upload symbolic file aliases: {p}")
+        rel = p.relative_to(root)
+        dest = out / rel.parent / (rel.name + "-link.txt")
+        if any(dest == r or dest in r.parents or r in dest.parents for r in reserved):
+            raise ValueError(f"link output conflicts with the state file: {dest}")
+        job = (state.data.get("jobs") or {}).get(str(p)) or {}
+        check_link_output(dest, out, job.get("link"))
+        outputs[p] = dest
+    destinations = set(outputs.values())
+    for dest in destinations:
+        if any(parent in destinations for parent in dest.parents):
+            raise ValueError(f"conflicting link output paths: {dest}")
+    return run_targets([("file", p, [p]) for p in files], state, jobs, outputs, out)
+
+
+def run_targets(
+    targets: list[tuple[str, Path, list[Path]]], state: JobState, jobs: int,
+    outputs: dict[Path, Path] | None = None, out: Path | None = None,
+) -> tuple[list[tuple[Path, str]], list[tuple[Path, BaseException]]]:
     d = state.data
-    skip = skip_paths(state.path)
-    targets = collect_split(paths, skip)
     if not targets:
         raise RuntimeError("no files")
     api = bind_api(d)
@@ -1030,8 +1106,20 @@ def run_split(paths: list[Path], state: JobState, jobs: int) -> tuple[list[tuple
         key = str(folder.resolve())
         with state.lock():
             job = jobs_d.setdefault(key, {"kind": kind, "path": key})
+        if outputs is not None:
+            meta = (job.get("files") or {}).get(folder.name) or {}
+            if (job.get("closed") or meta.get("done")) and stale(meta, folder):
+                raise RuntimeError(f"source changed after upload; use a new state and output directory: {folder}")
+            if job.get("xh") and not job.get("closed") and not meta.get("done"):
+                # An interrupted registration may have succeeded remotely; never publish duplicate nodes.
+                with state.lock():
+                    job.clear()
+                    job.update({"kind": kind, "path": key})
+                    state.save(api)
         if job.get("closed") and job.get("link"):
             log(f"{folder}: already closed, reusing {job['link']}")
+            if outputs is not None:
+                write_link(outputs[folder], out, job["link"])
             return folder, job["link"]
         if not job.get("xh"):
             h, xh = create_transfer(api, folder.name or "transfer")
@@ -1049,7 +1137,9 @@ def run_split(paths: list[Path], state: JobState, jobs: int) -> tuple[list[tuple
             with state.lock():
                 files_meta.setdefault(rel, file_meta(f))
             items.append((rel, f, job["root_h"]))
-        err = upload_pending(api, items, files_meta, state, per_target, bar=bar)
+        err = []
+        if outputs is None or not files_meta[folder.name].get("done"):
+            err = upload_pending(api, items, files_meta, state, per_target, bar=bar)
         if err or any(stale(files_meta.get(f.name) or {}, f) for f in files):
             state.save(api)
             log(f"{folder}: fail-closed, no link generated")
@@ -1060,6 +1150,8 @@ def run_split(paths: list[Path], state: JobState, jobs: int) -> tuple[list[tuple
             job["closed"] = True
             job["link"] = link
             state.save(api)
+        if outputs is not None:
+            write_link(outputs[folder], out, link)
         return folder, link
 
     n_pending = 0
@@ -1073,7 +1165,7 @@ def run_split(paths: list[Path], state: JobState, jobs: int) -> tuple[list[tuple
     bar = tqdm(total=n_pending, unit="file", desc="upload", leave=True, disable=VERBOSE)
     workers = max(1, min(jobs, len(targets)))
     per_target = split_jobs(jobs, workers)
-    log(f"mode=split targets={len(targets)} pending_files={n_pending} workers={workers} per_folder={per_target}")
+    log(f"mode={d.get('mode', 'split')} targets={len(targets)} pending_files={n_pending} workers={workers} per_target={per_target}")
     ex = ThreadPoolExecutor(max_workers=workers)
     futs = [ex.submit(one_target, t) for t in targets]
     try:
@@ -1091,6 +1183,250 @@ def run_split(paths: list[Path], state: JobState, jobs: int) -> tuple[list[tuple
     finally:
         bar.close()
     return links, errors
+
+
+def selfcheck_files() -> None:
+    import contextlib
+    from unittest.mock import patch
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        base = Path(tmpdir).resolve()
+        root, out, state_path = base / "src", base / "links", base / "files.json"
+        root.mkdir()
+        names = ("same.txt", "same.bin", "deep/层/one.bin", "zero", "bad.bin")
+        for name in names:
+            p = root / name
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_bytes(b"" if name == "zero" else b"test")
+        (root / "empty").mkdir()
+        transfers, uploads, closed = {}, [], []
+        fail_upload, fail_close = {"bad.bin"}, {"same.bin"}
+        lock = threading.Lock()
+        api = MegaAPI()
+        api.sid = "selfcheck"
+
+        def create(_api, _name):
+            with lock:
+                n = len(transfers) + 1
+                h, xh = f"{n:08d}", f"{n:012d}"
+                transfers[h] = {"xh": xh, "files": []}
+                return h, xh
+
+        def upload(_api, path, _name, parent):
+            with lock:
+                transfers[parent]["files"].append(path)
+                uploads.append(path)
+                if path.name in fail_upload:
+                    fail_upload.remove(path.name)
+                    raise OSError("registration outcome unknown")
+
+        def close(_api, xh):
+            with lock:
+                files = next(t["files"] for t in transfers.values() if t["xh"] == xh)
+                if any(p.name in fail_close for p in files):
+                    fail_close.difference_update(p.name for p in files)
+                    raise OSError("close failed")
+                closed.append(xh)
+
+        def invoke(argv):
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                try:
+                    return main(argv)
+                except SystemExit as exc:
+                    return exc.code
+
+        argv = ["--mode", "files", "--out", str(out), "--state", str(state_path), "-j", "3", str(root)]
+        real_write = write_link
+        failed_disk = []
+
+        def disk_write(path, destination, link):
+            saved = load_state(state_path)
+            assert any(j.get("closed") and j.get("link") == link for j in saved["jobs"].values())
+            if path.name == "one.bin-link.txt" and not failed_disk:
+                failed_disk.append(path)
+                raise OSError("disk unavailable")
+            real_write(path, destination, link)
+
+        with patch(__name__ + ".bind_api", return_value=api), \
+             patch(__name__ + ".create_transfer", side_effect=create), \
+             patch(__name__ + ".upload_bytes", side_effect=upload), \
+             patch(__name__ + ".close_transfer", side_effect=close), \
+             patch(__name__ + ".install_fast_interrupt"), \
+             patch(__name__ + ".write_link", side_effect=disk_write):
+            assert invoke(argv) == 1
+            saved = load_state(state_path)
+            assert len(saved["jobs"]) == len(names)
+            assert sum(j.get("closed", False) for j in saved["jobs"].values()) == 3
+            assert len(list(out.rglob("*-link.txt"))) == 2
+            assert not (out / "bad.bin-link.txt").exists()
+            assert not (out / "same.bin-link.txt").exists()
+            assert not (out / "empty").exists()
+            assert saved["jobs"][str(root / "same.bin")]["files"]["same.bin"]["done"]
+            (out / "zero-link.txt").unlink()
+            counts = len(transfers), len(uploads)
+            assert invoke(argv) == 0
+            assert (len(transfers), len(uploads)) == (counts[0] + 1, counts[1] + 1)
+            saved = load_state(state_path)
+            links = set()
+            for name in names:
+                p = root / name
+                dest = out / Path(name).parent / (p.name + "-link.txt")
+                job = saved["jobs"][str(p)]
+                assert job["closed"] and job["files"][p.name]["done"]
+                assert dest.read_bytes() == (job["link"] + "\n").encode("utf-8")
+                links.add(job["link"])
+                assert transfers[job["root_h"]]["files"] == [p]
+            assert len(links) == len(names) and len(closed) == len(names)
+            counts = len(transfers), len(uploads), len(closed)
+            assert invoke(argv) == 0
+            assert (len(transfers), len(uploads), len(closed)) == counts
+            assert len(list(out.rglob("*.txt"))) == len(names)
+            assert not list(out.rglob(".link-*"))
+
+            # Same-size edits within the same second must not silently reuse an old URL.
+            p = root / "same.txt"
+            st = p.stat()
+            p.write_bytes(b"edit")
+            edited_ns = (st.st_mtime_ns // 10**9) * 10**9 + (st.st_mtime_ns + 1_000_000) % 10**9
+            os.utime(p, ns=(st.st_atime_ns, edited_ns))
+            assert invoke(argv) == 1
+            assert (len(transfers), len(uploads), len(closed)) == counts
+            assert (out / "same.txt-link.txt").read_text() == saved["jobs"][str(p)]["link"] + "\n"
+
+            def rejected(source, destination, state_file=None):
+                before = len(transfers)
+                cmd = ["--mode", "files", "--out", str(destination), "--state",
+                       str(state_file or base / "reject.json"), str(source)]
+                assert invoke(cmd) != 0
+                assert len(transfers) == before
+
+            for destination in (root, root / "inside", base):
+                rejected(root, destination)
+            rejected(root / "same.txt", base / "file-input")
+
+            def denied_walk(_root, onerror=None):
+                if onerror is not None:
+                    onerror(PermissionError("unreadable subdirectory"))
+                yield str(root), [], ["same.txt"]
+
+            with patch(__name__ + ".os.walk", side_effect=denied_walk):
+                rejected(root, base / "unreadable-out")
+            rejected(root, base / "reserved", base / "reserved/same.txt-link.txt")
+            (base / "other").mkdir()
+            rejected(base / "other", base / "other-out", state_path)
+            (base / "no-files").mkdir()
+            rejected(base / "no-files", base / "empty-out")
+            assert not (base / "empty-out").exists()
+            assert invoke(["--mode", "files", str(root)]) == 2
+            assert invoke(["--out", str(out), str(root)]) == 2
+            assert invoke(argv + [str(base / "other")]) == 2
+
+            blocked = base / "blocked"
+            blocked.mkdir()
+            artifact = blocked / "same.txt-link.txt"
+            artifact.write_text("keep me", encoding="utf-8")
+            rejected(root, blocked)
+            assert artifact.read_text() == "keep me"
+            artifact.unlink()
+            (blocked / "deep").write_text("keep parent", encoding="utf-8")
+            rejected(root, blocked)
+
+            conflict = base / "conflict"
+            (conflict / "a-link.txt").mkdir(parents=True)
+            (conflict / "a").touch()
+            (conflict / "a-link.txt/x").touch()
+            rejected(conflict, base / "conflicting-out")
+
+            if os.name != "nt":
+                alias_out = base / "alias-out"
+                alias_out.mkdir()
+                (alias_out / "deep").symlink_to(base / "other", target_is_directory=True)
+                rejected(root, alias_out)
+                alias = root / "alias"
+                alias.symlink_to(root / "zero")
+                rejected(root, base / "alias-file-out")
+                alias.unlink()
+
+            changing = base / "changing"
+            changing.mkdir()
+            (changing / "file").write_bytes(b"before")
+            changed_state = base / "changing.json"
+            changed_cmd = ["--mode", "files", "--state", str(changed_state),
+                           "--out", str(base / "changed-links"), str(changing)]
+
+            def edit_during_upload(*args):
+                upload(*args)
+                args[1].write_bytes(b"after")
+
+            before = len(closed)
+            with patch(__name__ + ".upload_bytes", side_effect=edit_during_upload):
+                assert invoke(changed_cmd) == 1
+            assert len(closed) == before
+            abandoned = load_state(changed_state)["jobs"][str(changing / "file")]["xh"]
+            with patch(__name__ + ".write_link", side_effect=real_write):
+                assert invoke(changed_cmd) == 0
+            changed_job = load_state(changed_state)["jobs"][str(changing / "file")]
+            assert changed_job["xh"] != abandoned and changed_job["closed"]
+            assert transfers[changed_job["root_h"]]["files"] == [changing / "file"]
+
+            race_root, race_state = base / "race", base / "race.json"
+            race_root.mkdir()
+            race_file = race_root / "race"
+            race_file.write_bytes(b"test")
+            race_cmd = ["--mode", "files", "--state", str(race_state),
+                        "--out", str(base / "race-links"), str(race_root)]
+            fail_close.add("race")
+            with patch(__name__ + ".write_link", side_effect=real_write):
+                assert invoke(race_cmd) == 1
+                race_job = load_state(race_state)["jobs"][str(race_file)]
+                assert race_job["files"]["race"]["done"] and not race_job.get("closed")
+                st = race_file.stat()
+                real_meta = file_meta
+                edited = []
+
+                def edit_before_pending(path):
+                    if path == race_file and not edited:
+                        edited.append(path)
+                        path.write_bytes(b"edited")
+                    return real_meta(path)
+
+                counts = len(transfers), len(uploads), len(closed)
+                with patch(__name__ + ".file_meta", side_effect=edit_before_pending):
+                    assert invoke(race_cmd) == 1, "changed done file was re-uploaded during close-only resume"
+                assert edited and (len(transfers), len(uploads), len(closed)) == counts
+                assert not (base / "race-links/race-link.txt").exists()
+                race_file.write_bytes(b"test")
+                os.utime(race_file, ns=(st.st_atime_ns, st.st_mtime_ns))
+                assert invoke(race_cmd) == 0
+                assert len(uploads) == counts[1] and len(transfers) == counts[0]
+                assert transfers[race_job["root_h"]]["files"] == [race_file]
+
+            skipped = base / "skipped"
+            skipped.mkdir()
+            (skipped / "file").touch()
+            inside_state = skipped / "state.json"
+            Path(str(inside_state) + ".tmp").write_text("old staging data")
+            with patch(__name__ + ".write_link", side_effect=real_write):
+                assert invoke(["--mode", "files", "--state", str(inside_state), "--out",
+                               str(base / "skipped-links"), str(skipped)]) == 0
+            assert len(load_state(inside_state)["jobs"]) == 1
+            assert [p.name for p in (base / "skipped-links").iterdir()] == ["file-link.txt"]
+
+            # The existing split contract still groups siblings; tree still has one link.
+            legacy = base / "legacy"
+            legacy.mkdir()
+            (legacy / "a").touch()
+            (legacy / "b").touch()
+            before = len(transfers)
+            assert invoke(["--state", str(base / "tree.json"), str(legacy)]) == 0
+            assert len(transfers) == before + 1
+            assert len(list(transfers.values())[-1]["files"]) == 2
+            (legacy / "nested").mkdir()
+            (legacy / "nested/c").touch()
+            before = len(transfers)
+            assert invoke(["--mode", "split", "--state", str(base / "split.json"), str(legacy)]) == 0
+            assert len(transfers) == before + 2
+            assert sorted(len(t["files"]) for t in list(transfers.values())[before:]) == [1, 2]
 
 
 def selfcheck() -> None:
@@ -1428,6 +1764,7 @@ def selfcheck() -> None:
             {"mode": "nope"},
             {"mode": "split", "jobs": {"a": {"xh": "x"}}},
             {"mode": "tree", "files": {"a.txt": {"size": "big"}}},
+            {"mode": "files", "files": {"a.txt": {"size": 1, "mtime": 0, "mtime_ns": "bad"}}},
             {"mode": "tree", "closed": True, "link": "arbitrary"},
             {"mode": "tree", "closed": "yes", "xh": "a" * 12, "root_h": "b" * 8, "link": "l"},
             {"mode": "tree", "files": {"a.txt": {"size": 1, "mtime": 0, "done": "false"}}},
@@ -1499,6 +1836,7 @@ def selfcheck() -> None:
         raise AssertionError("malformed folder handle accepted")
     except RuntimeError:
         pass
+    selfcheck_files()
     print("selfcheck ok")
 
 
@@ -1519,10 +1857,11 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("-j", "--jobs", type=int, default=4, help="parallel file uploads (default 4)")
     ap.add_argument(
         "--mode",
-        choices=("tree", "split"),
+        choices=("tree", "split", "files"),
         default="tree",
-        help="tree: one link, keep relative paths (default). split: one link per folder, direct files only",
+        help="tree: one link (default). split: one link per folder's direct files. files: one link per file, recursive",
     )
+    ap.add_argument("-o", "--out", type=Path, help="link output directory (required for --mode files)")
     ap.add_argument("--state", type=Path, default=Path(".transferit-upload.json"), help="resume json (never uploaded)")
     ap.add_argument("-v", "--verbose", action="store_true", help="timestamped phase log on stderr, with a stall watchdog")
     ap.add_argument(
@@ -1549,6 +1888,12 @@ def main(argv: list[str] | None = None) -> int:
         ap.error("need paths or --selfcheck")
     if args.jobs < 1:
         ap.error("--jobs must be >= 1")
+    if args.mode == "files" and args.out is None:
+        ap.error("--mode files requires --out")
+    if args.mode != "files" and args.out is not None:
+        ap.error("--out requires --mode files")
+    if args.mode in ("tree", "files") and len(args.paths) != 1:
+        ap.error(f"{args.mode} mode needs exactly one path")
     state_path = args.state.resolve()
     try:
         prev = load_state(state_path)
@@ -1561,14 +1906,13 @@ def main(argv: list[str] | None = None) -> int:
     data = prev or {"mode": args.mode}
     data["mode"] = args.mode
     state = JobState(state_path, data)
-    if args.mode == "tree":
-        if len(args.paths) != 1:
-            ap.error("tree mode needs exactly one path (use --mode split)")
+    if args.mode in ("tree", "files"):
         root = args.paths[0].resolve()
         if data.get("root") and Path(data["root"]) != root:
             print(f"error: state root {data['root']!r} != {str(root)!r}", file=sys.stderr)
             return 1
         data["root"] = str(root)
+    if args.mode == "tree":
         try:
             link = run_tree(root, state, args.jobs)
         except Exception as e:
@@ -1577,7 +1921,10 @@ def main(argv: list[str] | None = None) -> int:
         print(link)
         return 0
     try:
-        links, errors = run_split(args.paths, state, args.jobs)
+        if args.mode == "files":
+            links, errors = run_files(root, args.out, state, args.jobs)
+        else:
+            links, errors = run_split(args.paths, state, args.jobs)
     except Exception as e:
         print(f"error: {e}", file=sys.stderr)
         return 1
